@@ -41,6 +41,7 @@ const LOG_FILE = path.join(__dirname, 'drone_log.txt');
 const CONTROL_LOG_FILE = path.join(__dirname, 'control_log.txt');
 const DEFAULT_DRONE_ID = 'drone-1';
 const OFFLINE_AFTER_MS = 15000; // a drone with no telemetry in this window is shown as offline
+const DEFAULT_FOV_DEG = 78; // typical FPV/action-cam horizontal field of view
 
 // droneId -> latest telemetry payload (+ bookkeeping)
 const drones = {};
@@ -55,10 +56,31 @@ function getOrCreateControlState(droneId) {
     return controlState[droneId];
 }
 
+// Normalizes whatever shape "camels" arrived in into an array of
+// { id, lat, lng } so the client can always drop red dots on the map.
+// Accepts: array of {lat,lng}/{latitude,longitude}, or a bare count/anything
+// else (in which case there are no positions to plot, just a count).
+function normalizeCamels(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .map((c, i) => {
+            if (c && typeof c === 'object') {
+                const lat = c.lat ?? c.latitude;
+                const lng = c.lng ?? c.lon ?? c.longitude;
+                if (typeof lat === 'number' && typeof lng === 'number') {
+                    return { id: c.id ?? String(i), lat, lng, confidence: c.confidence ?? null };
+                }
+            }
+            return null;
+        })
+        .filter(Boolean);
+}
+
 function fleetSummary() {
     const now = Date.now();
     return Object.keys(drones).map((id) => {
         const d = drones[id];
+        const camels = normalizeCamels(d.camels);
         return {
             droneId: id,
             name: d.name || id,
@@ -68,7 +90,9 @@ function fleetSummary() {
             yaw: d.drone?.yaw ?? 0,
             pitch: d.drone?.pitch ?? 0,
             hasGPSFix: !!d.drone?.hasGPSFix,
-            camels: Array.isArray(d.camels) ? d.camels.length : 0,
+            camelCount: Array.isArray(d.camels) ? d.camels.length : 0,
+            camels, // full positions (may be empty even if camelCount > 0)
+            fovDeg: (typeof d.camera?.fovDeg === 'number') ? d.camera.fovDeg : DEFAULT_FOV_DEG,
             isLive: !!d.isLive,
             streamKey: d.streamKey || id,
             armed: !!d.armed,
@@ -82,7 +106,11 @@ function fleetSummary() {
 // 2. TELEMETRY INGEST (one or many drones)
 // ==========================================
 // Body shape (droneId optional, defaults to "drone-1" for single-drone setups):
-// { droneId, name, clientTimestamp, drone: {lat,lng,yaw,pitch,alt,hasGPSFix}, camels: [...], isLive, streamKey, armed }
+// { droneId, name, clientTimestamp,
+//   drone: {lat,lng,yaw,pitch,alt,hasGPSFix},
+//   camera: { fovDeg },                      // optional, defaults to 78
+//   camels: [{id,lat,lng,confidence}, ...],  // positions, OR a bare count
+//   isLive, streamKey, armed }
 app.post('/api/telemetry', (req, res) => {
     const serverReceiveTime = Date.now();
     const body = req.body || {};
@@ -103,7 +131,17 @@ app.post('/api/telemetry', (req, res) => {
         if (err) console.error('Failed to write to log file:', err);
     });
 
-    io.emit('telemetry_update', record);
+    // Emit the normalized shape (with camels positions + fovDeg resolved) so
+    // every connected client — including ones that just reconnected — gets
+    // a consistent record, whether it came from a live socket push or a
+    // fresh /api/drones fetch after a page refresh.
+    const emitRecord = {
+        ...record,
+        camels: normalizeCamels(record.camels),
+        camelCount: Array.isArray(record.camels) ? record.camels.length : 0,
+        fovDeg: (typeof record.camera?.fovDeg === 'number') ? record.camera.fovDeg : DEFAULT_FOV_DEG
+    };
+    io.emit('telemetry_update', emitRecord);
 
     res.status(200).json({
         message: 'Data received and logged',
@@ -113,7 +151,9 @@ app.post('/api/telemetry', (req, res) => {
 });
 
 // Snapshot of the whole fleet — used by the dashboard on load,
-// before any live socket events have arrived.
+// before any live socket events have arrived, AND used as a periodic
+// resync safety net by the client so a dropped socket event (or a page
+// refresh that races a slow first fetch) never makes a drone "disappear".
 app.get('/api/drones', (req, res) => {
     res.status(200).json(fleetSummary());
 });
@@ -262,6 +302,14 @@ function sharedStyles() {
             display: flex; align-items: center; gap: 6px;
         }
 
+        .conn-pill {
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            border: 1px solid var(--border); border-radius: 20px; padding: 5px 12px;
+            display: flex; align-items: center; gap: 6px; color: var(--text-dim);
+        }
+        .conn-pill.ok { color: var(--green); border-color: var(--green); }
+        .conn-pill.bad { color: var(--red); border-color: var(--red); }
+
         .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
         .dot.online { background: var(--green); box-shadow: 0 0 0 0 rgba(87,199,122,0.6); animation: pulse 2s infinite; }
         .dot.offline { background: var(--text-faint); }
@@ -338,6 +386,19 @@ function sharedStyles() {
         @media (max-width: 980px) { .quad { grid-template-columns: 1fr; grid-template-rows: repeat(4, minmax(220px, 1fr)); overflow-y: auto; } }
 
         #map { flex: 1 1 auto; min-height: 0; width: 100%; border-radius: 0 0 var(--radius) var(--radius); filter: saturate(0.35) brightness(0.85) contrast(1.05); }
+
+        .map-legend {
+            position: absolute; left: 8px; bottom: 8px; z-index: 500;
+            background: rgba(13,17,23,0.78); backdrop-filter: blur(3px);
+            border: 1px solid var(--border); border-radius: 6px;
+            padding: 6px 9px; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+            color: var(--text-dim); display: flex; flex-direction: column; gap: 4px;
+            pointer-events: none;
+        }
+        .map-legend .row { display: flex; align-items: center; gap: 6px; }
+        .map-legend .swatch { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+        .map-legend .swatch.camel { background: var(--red); box-shadow: 0 0 0 2px rgba(229,72,77,0.3); }
+        .map-legend .swatch.fov { background: rgba(95,212,208,0.35); border: 1px solid var(--cyan); border-radius: 2px; }
 
         .video-container {
             position: relative; width: 100%; flex: 1 1 auto; min-height: 0; background: #05070a;
@@ -516,7 +577,7 @@ function sharedStyles() {
         .fw-card .fw-status.offline { color: var(--text-faint); }
         .fw-card .fw-map {
             position: absolute; right: 8px; bottom: 40px; z-index: 3;
-            width: 110px; height: 90px;
+            width: 130px; height: 110px;
             border: 1px solid var(--border); border-radius: 6px;
             overflow: hidden;
             filter: saturate(0.35) brightness(0.85) contrast(1.05);
@@ -553,9 +614,199 @@ function topBar(fleetCount, activeNav) {
                 ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
                 ${navLink('/fleet-wall', 'FLEET WALL', 'fleet-wall')}
                 ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
+                <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
                 <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
             </div>
         </div>
+    `;
+}
+
+// ==========================================
+// 4b. SHARED CLIENT-SIDE HELPERS
+// Inlined into every page's <script> block so there is one source of
+// truth for: geo math (FOV cone / destination-point), the flv.js player
+// wrapper (with the long-flight stall fix), and the socket/connection
+// resync logic (the "drone disappears on refresh" fix).
+// ==========================================
+function clientCoreScript() {
+    return `
+        // ---------- geo math ----------
+        // Great-circle destination point given a start point, bearing, and
+        // distance — used to draw the drone's camera FOV footprint on the map.
+        function destPoint(lat, lng, bearingDeg, distanceM) {
+            const R = 6378137;
+            const brng = bearingDeg * Math.PI / 180;
+            const lat1 = lat * Math.PI / 180;
+            const lng1 = lng * Math.PI / 180;
+            const dR = distanceM / R;
+            const lat2 = Math.asin(Math.sin(lat1) * Math.cos(dR) + Math.cos(lat1) * Math.sin(dR) * Math.cos(brng));
+            const lng2 = lng1 + Math.atan2(
+                Math.sin(brng) * Math.sin(dR) * Math.cos(lat1),
+                Math.cos(dR) - Math.sin(lat1) * Math.sin(lat2)
+            );
+            return [lat2 * 180 / Math.PI, lng2 * 180 / Math.PI];
+        }
+
+        // Builds a wedge (apex + arc) representing the drone's ground FOV,
+        // centered on its heading (yaw). Radius scales with altitude so the
+        // footprint grows as the drone climbs.
+        function fovPolygon(lat, lng, yawDeg, altM, fovDeg) {
+            const radius = Math.max(15, (altM || 10) * 2.2);
+            const half = (fovDeg || 78) / 2;
+            const steps = 10;
+            const pts = [[lat, lng]];
+            for (let i = 0; i <= steps; i++) {
+                const bearing = (yawDeg || 0) - half + (i * (fovDeg || 78) / steps);
+                pts.push(destPoint(lat, lng, bearing, radius));
+            }
+            pts.push([lat, lng]);
+            return pts;
+        }
+
+        // ---------- flv.js live player with long-flight stall fix ----------
+        // Symptom this fixes: video freezes after streaming for a long time
+        // and only comes back after a manual page refresh. Root causes are
+        // (a) flv.js's internal source buffer growing unbounded over a long
+        // live session, and (b) playback silently drifting behind the live
+        // edge with nothing forcing it to catch up. autoCleanupSourceBuffer
+        // fixes (a); the watchdog below fixes (b) and also recovers from a
+        // stalled decoder without the user having to do anything.
+        function createLivePlayer(streamKey, videoEl, onStatus) {
+            if (typeof flvjs === 'undefined' || !flvjs.isSupported()) {
+                if (onStatus) onStatus('unsupported', false);
+                return null;
+            }
+            const url = 'http://' + window.location.hostname + ':8000/live/' + streamKey + '.flv';
+            const player = flvjs.createPlayer(
+                { type: 'flv', isLive: true, url: url },
+                {
+                    enableStashBuffer: false,
+                    stashInitialSize: 128,
+                    autoCleanupSourceBuffer: true,
+                    autoCleanupMaxBackwardDuration: 10,
+                    autoCleanupMinBackwardDuration: 6,
+                    lazyLoad: false
+                }
+            );
+
+            let destroyed = false;
+            let stallTicks = 0;
+            let lastTime = -1;
+
+            function teardown() {
+                destroyed = true;
+                if (watchdog) clearInterval(watchdog);
+                try { player.pause(); player.unload(); player.detachMediaElement(); player.destroy(); } catch (e) {}
+            }
+
+            player.on(flvjs.Events.ERROR, (errType, errDetail) => {
+                if (onStatus) onStatus('retrying', false);
+                if (!destroyed) setTimeout(() => { if (!destroyed) restart(); }, 3000);
+            });
+            player.on(flvjs.Events.LOADING_COMPLETE, () => { if (onStatus) onStatus('ended', false); });
+
+            videoEl.addEventListener('playing', () => { if (onStatus) onStatus('live', true); }, { once: false });
+
+            // Watches for two failure modes that a plain onerror handler
+            // misses: (1) the decoder stalls with no error event, and
+            // (2) playback slowly drifts seconds behind the live edge.
+            // Every 3s: if currentTime hasn't advanced, count a stall tick;
+            // two ticks in a row (~6s frozen) forces a full reconnect.
+            // If it HAS advanced but has drifted >4s behind the buffered
+            // edge, jump forward instead of tearing down the whole player.
+            const watchdog = setInterval(() => {
+                if (destroyed || !videoEl.isConnected) { clearInterval(watchdog); return; }
+                if (videoEl.paused || videoEl.ended) return;
+                if (videoEl.currentTime === lastTime) {
+                    stallTicks += 1;
+                    if (stallTicks >= 2) {
+                        stallTicks = 0;
+                        if (onStatus) onStatus('recovering', false);
+                        restart();
+                        return;
+                    }
+                } else {
+                    stallTicks = 0;
+                    const buf = videoEl.buffered;
+                    if (buf && buf.length) {
+                        const end = buf.end(buf.length - 1);
+                        if (end - videoEl.currentTime > 4) {
+                            try { videoEl.currentTime = end - 0.5; } catch (e) {}
+                        }
+                    }
+                }
+                lastTime = videoEl.currentTime;
+            }, 3000);
+
+            function restart() {
+                try { player.unload(); } catch (e) {}
+                try {
+                    player.load();
+                    player.play().catch(() => {});
+                } catch (e) {
+                    // player object is in a bad state — caller should recreate it
+                    if (onStatus) onStatus('retrying', false);
+                }
+            }
+
+            player.attachMediaElement(videoEl);
+            player.load();
+            player.play().catch(() => { if (onStatus) onStatus('tap to play', false); });
+
+            return { player, destroy: teardown, restart };
+        }
+
+        // ---------- socket + resync (the "drone disappears on refresh" fix) ----------
+        // A page refresh used to rely on a single fetch('/api/drones') racing
+        // against the socket connecting. If that fetch ran before the server
+        // had anything, or failed, or the socket reconnected later and missed
+        // an event, drones would vanish until the next lucky telemetry packet.
+        // This wraps that in: retry-on-failure, a periodic resync poll as a
+        // backup to the socket, and a resync on every socket (re)connect.
+        function setupResilientFeed(applyFn, connPillId, connLabelId) {
+            const socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 5000 });
+
+            function setConn(ok, label) {
+                const pill = document.getElementById(connPillId);
+                const dot = pill ? pill.querySelector('.dot') : null;
+                const lab = document.getElementById(connLabelId);
+                if (pill) pill.className = 'conn-pill ' + (ok ? 'ok' : 'bad');
+                if (dot) dot.className = 'dot ' + (ok ? 'online' : 'offline');
+                if (lab) lab.innerText = label;
+            }
+
+            function fetchSnapshot(retriesLeft) {
+                fetch('/api/drones')
+                    .then(r => r.json())
+                    .then(list => { list.forEach(applyFn); })
+                    .catch(() => {
+                        if (retriesLeft > 0) setTimeout(() => fetchSnapshot(retriesLeft - 1), 1500);
+                    });
+            }
+
+            socket.on('connect', () => {
+                setConn(true, 'live');
+                // Always resync on (re)connect — this is what stops a missed
+                // event during a dropped socket from leaving a stale/missing
+                // drone on screen after the socket comes back.
+                fetchSnapshot(5);
+            });
+            socket.on('disconnect', () => setConn(false, 'reconnecting…'));
+            socket.on('connect_error', () => setConn(false, 'reconnecting…'));
+
+            socket.on('telemetry_update', applyFn);
+
+            // Backup to the socket: even with a healthy connection, poll the
+            // full snapshot periodically so a silently-missed event (or a
+            // drone the socket never got a chance to announce) can't leave
+            // the fleet list stuck.
+            setInterval(() => fetchSnapshot(1), 5000);
+
+            // Kick off the first load immediately, with retries.
+            fetchSnapshot(5);
+
+            return socket;
+        }
     `;
 }
 
@@ -586,7 +837,13 @@ app.get('/dashboard', (req, res) => {
                 <div class="quad">
                     <div class="panel">
                         <div class="panel-header"><h3>Fleet Position</h3><span class="mono" style="font-size:11px;color:var(--text-faint);" id="selectedLabel">no drone selected</span></div>
-                        <div id="map"></div>
+                        <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                            <div id="map"></div>
+                            <div class="map-legend">
+                                <div class="row"><span class="swatch fov"></span>camera FOV</div>
+                                <div class="row"><span class="swatch camel"></span>camel tracked</div>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="panel">
@@ -653,16 +910,19 @@ app.get('/dashboard', (req, res) => {
             </div>
 
             <script>
-                const socket = io();
+                ${clientCoreScript()}
+
                 const dronesById = {};
                 let selectedDroneId = null;
-                let flvPlayer = null;
-                let retryTimer = null;
+                let livePlayer = null;
+                try { selectedDroneId = localStorage.getItem('ffly_selected_drone') || null; } catch (e) {}
 
                 // ---------- Map ----------
                 const map = L.map('map', { zoomControl: true }).setView([22.3098, 39.1065], 17);
                 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
                 const markers = {};
+                const fovLayers = {};      // droneId -> L.polygon (camera FOV wedge)
+                const camelLayers = {};    // droneId -> L.layerGroup of red dots
 
                 function droneIcon(online, selected) {
                     const ring = selected ? '0 0 0 6px rgba(95,212,208,0.25)' : 'none';
@@ -690,10 +950,11 @@ app.get('/dashboard', (req, res) => {
                         const d = dronesById[id];
                         const online = (Date.now() - (d.lastUpdate || 0)) < 15000;
                         const sel = id === selectedDroneId ? 'selected' : '';
+                        const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
                         return '<div class="drone-card ' + sel + '" data-id="' + id + '">' +
                             '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
                             '<div class="info"><div class="name">' + (d.name || id) + '</div>' +
-                            '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + (Array.isArray(d.camels) ? d.camels.length : 0) + ' tracked</div></div>' +
+                            '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + camelCount + ' tracked</div></div>' +
                             '<div class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</div>' +
                         '</div>';
                     }).join('');
@@ -705,6 +966,7 @@ app.get('/dashboard', (req, res) => {
 
                 function selectDrone(id) {
                     selectedDroneId = id;
+                    try { localStorage.setItem('ffly_selected_drone', id); } catch (e) {}
                     document.getElementById('selectedLabel').innerText = id;
                     document.getElementById('targetDroneLabel').innerText = 'target: ' + id;
                     setControlsEnabled(true);
@@ -714,7 +976,7 @@ app.get('/dashboard', (req, res) => {
                     if (d) {
                         const key = d.streamKey || id;
                         document.getElementById('streamKeyInput').value = key;
-                        startFlvPlayer(key);
+                        startLiveVideo(key);
                         if (d.drone && d.drone.lat) map.panTo([d.drone.lat, d.drone.lng]);
                     }
                 }
@@ -722,12 +984,13 @@ app.get('/dashboard', (req, res) => {
                 // ---------- Telemetry panel (shows the currently selected drone) ----------
                 function updateTelemetryPanel() {
                     const d = selectedDroneId ? dronesById[selectedDroneId] : null;
+                    const camelCount = d ? (Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0)) : null;
                     document.getElementById('lat').innerText = d ? fmtNum(d.drone?.lat, 6) : '—';
                     document.getElementById('lng').innerText = d ? fmtNum(d.drone?.lng, 6) : '—';
                     document.getElementById('alt').innerText = d ? fmtNum(d.drone?.alt, 1) + ' m' : '—';
                     document.getElementById('yaw').innerText = d ? fmtNum(d.drone?.yaw, 1) + '°' : '—';
                     document.getElementById('pitch').innerText = d ? fmtNum(d.drone?.pitch, 1) + '°' : '—';
-                    document.getElementById('camels').innerText = d && Array.isArray(d.camels) ? d.camels.length : '—';
+                    document.getElementById('camels').innerText = camelCount === null ? '—' : camelCount;
                     document.getElementById('gps').innerText = d ? (d.drone?.hasGPSFix ? 'LOCKED' : 'NO FIX') : '—';
                     document.getElementById('armState').innerText = d ? (d.armed ? 'ARMED' : 'STANDBY') : '—';
                 }
@@ -736,6 +999,7 @@ app.get('/dashboard', (req, res) => {
                     if (!d.drone || !d.drone.lat || !d.drone.lng) return;
                     const online = (Date.now() - (d.lastUpdate || 0)) < 15000;
                     const latlng = [d.drone.lat, d.drone.lng];
+
                     if (markers[id]) {
                         markers[id].setLatLng(latlng);
                         markers[id].setIcon(droneIcon(online, id === selectedDroneId));
@@ -745,6 +1009,28 @@ app.get('/dashboard', (req, res) => {
                             .bindPopup(d.name || id)
                             .on('click', () => selectDrone(id));
                     }
+
+                    // Camera FOV wedge, oriented by yaw, sized by altitude.
+                    const poly = fovPolygon(d.drone.lat, d.drone.lng, d.drone.yaw, d.drone.alt, d.fovDeg);
+                    if (fovLayers[id]) {
+                        fovLayers[id].setLatLngs(poly);
+                    } else {
+                        fovLayers[id] = L.polygon(poly, {
+                            color: '#5fd4d0', weight: 1, fillColor: '#5fd4d0', fillOpacity: 0.16, interactive: false
+                        }).addTo(map);
+                    }
+
+                    // Red dots for every camel currently tracked by this drone.
+                    const camels = Array.isArray(d.camels) ? d.camels : [];
+                    if (!camelLayers[id]) camelLayers[id] = L.layerGroup().addTo(map);
+                    camelLayers[id].clearLayers();
+                    camels.forEach((c) => {
+                        if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                            L.circleMarker([c.lat, c.lng], {
+                                radius: 5, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
+                            }).addTo(camelLayers[id]);
+                        }
+                    });
                 }
 
                 function applyUpdate(data) {
@@ -760,13 +1046,25 @@ app.get('/dashboard', (req, res) => {
 
                     const countEl = document.getElementById('fleetCount');
                     if (countEl) countEl.innerText = Object.keys(dronesById).length;
+
+                    // If we had a remembered selection (e.g. from before a
+                    // refresh) but hadn't loaded its stream yet, do it now that
+                    // its telemetry has arrived.
+                    if (id === selectedDroneId && !livePlayer && data.streamKey) {
+                        document.getElementById('selectedLabel').innerText = id;
+                        document.getElementById('targetDroneLabel').innerText = 'target: ' + id;
+                        setControlsEnabled(true);
+                        document.getElementById('streamKeyInput').value = data.streamKey;
+                        startLiveVideo(data.streamKey);
+                    }
                 }
 
-                fetch('/api/drones').then(r => r.json()).then((list) => {
-                    list.forEach((d) => applyUpdate({ ...d, drone: { lat: d.lat, lng: d.lng, yaw: d.yaw, pitch: d.pitch, alt: d.alt, hasGPSFix: d.hasGPSFix } }));
-                }).catch(() => {});
-
-                socket.on('telemetry_update', applyUpdate);
+                const socket = setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
+                socket.on('control_command', (entry) => {
+                    if (entry.droneId === selectedDroneId) {
+                        setCommandStatus(entry.command + (entry.params ? ' ' + JSON.stringify(entry.params) : '') + ' confirmed (id: ' + entry.commandId + ')', 'var(--green)');
+                    }
+                });
 
                 // ---------- Live video ----------
                 function setStreamStatus(msg, color) {
@@ -777,39 +1075,26 @@ app.get('/dashboard', (req, res) => {
                     }
                 }
 
-                function startFlvPlayer(streamKey) {
+                function startLiveVideo(streamKey) {
                     document.getElementById('videoPlaceholder').style.display = 'none';
-                    if (typeof flvjs === 'undefined' || !flvjs.isSupported()) {
-                        setStreamStatus('FLV.js is not supported in this browser.', 'var(--red)');
-                        return;
-                    }
-                    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-                    if (flvPlayer) {
-                        try { flvPlayer.pause(); flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch (e) {}
-                        flvPlayer = null;
-                    }
-                    const url = 'http://' + window.location.hostname + ':8000/live/' + streamKey + '.flv';
+                    if (livePlayer) { livePlayer.destroy(); livePlayer = null; }
                     setStreamStatus('Connecting to ' + streamKey + ' …');
-
                     const videoElement = document.getElementById('videoElement');
-                    flvPlayer = flvjs.createPlayer({ type: 'flv', isLive: true, url: url });
-                    flvPlayer.on(flvjs.Events.ERROR, (errType, errDetail) => {
-                        setStreamStatus('Stream error: ' + errType + ' — retrying in 3s…', 'var(--red)');
-                        retryTimer = setTimeout(() => startFlvPlayer(streamKey), 3000);
+                    livePlayer = createLivePlayer(streamKey, videoElement, (status, isLive) => {
+                        if (status === 'live') setStreamStatus('Live ●', 'var(--green)');
+                        else if (status === 'retrying') setStreamStatus('Stream error — retrying…', 'var(--red)');
+                        else if (status === 'recovering') setStreamStatus('Stream stalled — reconnecting…', 'var(--amber)');
+                        else if (status === 'ended') setStreamStatus('Stream ended.', 'var(--amber)');
+                        else if (status === 'unsupported') setStreamStatus('FLV.js is not supported in this browser.', 'var(--red)');
+                        else if (status === 'tap to play') setStreamStatus('Autoplay blocked — click the video to start playback.', 'var(--amber)');
                     });
-                    flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => setStreamStatus('Stream ended.', 'var(--amber)'));
-                    videoElement.addEventListener('playing', () => setStreamStatus('Live ●', 'var(--green)'), { once: true });
-
-                    flvPlayer.attachMediaElement(videoElement);
-                    flvPlayer.load();
-                    flvPlayer.play().catch(() => setStreamStatus('Autoplay blocked — click the video to start playback.', 'var(--amber)'));
                 }
 
                 document.getElementById('loadStreamBtn').addEventListener('click', () => {
                     const key = document.getElementById('streamKeyInput').value.trim() || (selectedDroneId || 'drone-1');
-                    startFlvPlayer(key);
+                    startLiveVideo(key);
                 });
-                document.getElementById('videoElement').addEventListener('click', () => { if (flvPlayer) flvPlayer.play().catch(() => {}); });
+                document.getElementById('videoElement').addEventListener('click', () => { if (livePlayer) livePlayer.player.play().catch(() => {}); });
 
                 // ---------- Flight control ----------
                 const controlIds = ['btnArm','btnDisarm','btnTakeoff','btnLand','btnRtl','btnEmergency','gimbalPitch','btnYawLeft','btnYawReset','btnYawRight'];
@@ -872,12 +1157,6 @@ app.get('/dashboard', (req, res) => {
                     document.getElementById('btnYawReset').addEventListener('click', () => sendCommand('SET_YAW', { absolute: 0 }));
                     document.getElementById('btnYawRight').addEventListener('click', () => sendCommand('SET_YAW', { relative: 15 }));
                 }
-
-                socket.on('control_command', (entry) => {
-                    if (entry.droneId === selectedDroneId) {
-                        setCommandStatus(entry.command + (entry.params ? ' ' + JSON.stringify(entry.params) : '') + ' confirmed (id: ' + entry.commandId + ')', 'var(--green)');
-                    }
-                });
             </script>
         </body>
         </html>
@@ -916,15 +1195,12 @@ app.get('/video-wall', (req, res) => {
             </div>
 
             <script>
-                const socket = io();
+                ${clientCoreScript()}
+
                 const dronesById = {};   // droneId -> latest telemetry record
-                const players = {};      // droneId -> flv.js player instance
+                const players = {};      // droneId -> live player wrapper from createLivePlayer
                 const renderState = {};  // droneId -> {online, live} as of the last DOM rebuild
                 const OFFLINE_AFTER_MS = 15000;
-
-                function fmtNum(n, digits) {
-                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
-                }
 
                 function isOnline(d) {
                     return (Date.now() - (d.lastUpdate || 0)) < OFFLINE_AFTER_MS;
@@ -945,31 +1221,17 @@ app.get('/video-wall', (req, res) => {
                 }
 
                 function destroyPlayer(id) {
-                    const p = players[id];
-                    if (!p) return;
-                    try { p.pause(); p.unload(); p.detachMediaElement(); p.destroy(); } catch (e) {}
-                    delete players[id];
+                    if (players[id]) { players[id].destroy(); delete players[id]; }
                 }
 
                 function startPlayer(id, streamKey, videoEl, statusEl) {
                     destroyPlayer(id);
-                    if (typeof flvjs === 'undefined' || !flvjs.isSupported()) {
-                        if (statusEl) { statusEl.innerText = 'unsupported'; statusEl.className = 'tile-status offline'; }
-                        return;
-                    }
-                    const url = 'http://' + window.location.hostname + ':8000/live/' + streamKey + '.flv';
-                    const player = flvjs.createPlayer({ type: 'flv', isLive: true, url: url });
-                    players[id] = player;
-                    player.on(flvjs.Events.ERROR, () => {
-                        if (statusEl) { statusEl.innerText = 'retrying'; statusEl.className = 'tile-status offline'; }
-                        setTimeout(() => { if (dronesById[id] && dronesById[id].isLive) startPlayer(id, streamKey, videoEl, statusEl); }, 3000);
+                    players[id] = createLivePlayer(streamKey, videoEl, (status) => {
+                        if (!statusEl) return;
+                        if (status === 'live') { statusEl.innerText = 'live'; statusEl.className = 'tile-status live'; }
+                        else if (status === 'retrying' || status === 'recovering') { statusEl.innerText = status === 'recovering' ? 'reconnecting' : 'retrying'; statusEl.className = 'tile-status offline'; }
+                        else if (status === 'unsupported') { statusEl.innerText = 'unsupported'; statusEl.className = 'tile-status offline'; }
                     });
-                    videoEl.addEventListener('playing', () => {
-                        if (statusEl) { statusEl.innerText = 'live'; statusEl.className = 'tile-status live'; }
-                    }, { once: true });
-                    player.attachMediaElement(videoEl);
-                    player.load();
-                    player.play().catch(() => {});
                 }
 
                 function tileHTML(id, d) {
@@ -1072,11 +1334,7 @@ app.get('/video-wall', (req, res) => {
                     refresh(id);
                 }
 
-                fetch('/api/drones').then(r => r.json()).then((list) => {
-                    list.forEach((d) => applyUpdate(d));
-                }).catch(() => {});
-
-                socket.on('telemetry_update', applyUpdate);
+                setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
 
                 // Periodic sweep to catch a drone going offline purely from the
                 // passage of time (no new packet needed to notice a timeout).
@@ -1121,10 +1379,11 @@ app.get('/fleet-wall', (req, res) => {
             </div>
 
             <script>
-                const socket = io();
+                ${clientCoreScript()}
+
                 const dronesById = {};   // droneId -> latest telemetry record
-                const players = {};      // droneId -> flv.js player instance
-                const maps = {};         // droneId -> { map, marker }
+                const players = {};      // droneId -> live player wrapper from createLivePlayer
+                const maps = {};         // droneId -> { map, marker, fov, camelLayer }
                 const renderState = {};  // droneId -> {online, live, hasFix} as of the last DOM rebuild
                 const OFFLINE_AFTER_MS = 15000;
 
@@ -1146,36 +1405,22 @@ app.get('/fleet-wall', (req, res) => {
                     return !!a && !!b && a.online === b.online && a.live === b.live && a.hasFix === b.hasFix;
                 }
 
-                // ---------- video (same flv.js pattern as dashboard/video-wall) ----------
+                // ---------- video (shared flv.js wrapper with the stall fix) ----------
                 function destroyPlayer(id) {
-                    const p = players[id];
-                    if (!p) return;
-                    try { p.pause(); p.unload(); p.detachMediaElement(); p.destroy(); } catch (e) {}
-                    delete players[id];
+                    if (players[id]) { players[id].destroy(); delete players[id]; }
                 }
 
                 function startPlayer(id, streamKey, videoEl, statusEl) {
                     destroyPlayer(id);
-                    if (typeof flvjs === 'undefined' || !flvjs.isSupported()) {
-                        if (statusEl) { statusEl.innerText = 'unsupported'; statusEl.className = 'fw-status offline'; }
-                        return;
-                    }
-                    const url = 'http://' + window.location.hostname + ':8000/live/' + streamKey + '.flv';
-                    const player = flvjs.createPlayer({ type: 'flv', isLive: true, url: url });
-                    players[id] = player;
-                    player.on(flvjs.Events.ERROR, () => {
-                        if (statusEl) { statusEl.innerText = 'retrying'; statusEl.className = 'fw-status offline'; }
-                        setTimeout(() => { if (dronesById[id] && dronesById[id].isLive) startPlayer(id, streamKey, videoEl, statusEl); }, 3000);
+                    players[id] = createLivePlayer(streamKey, videoEl, (status) => {
+                        if (!statusEl) return;
+                        if (status === 'live') { statusEl.innerText = 'live'; statusEl.className = 'fw-status live'; }
+                        else if (status === 'retrying' || status === 'recovering') { statusEl.innerText = status === 'recovering' ? 'reconnecting' : 'retrying'; statusEl.className = 'fw-status offline'; }
+                        else if (status === 'unsupported') { statusEl.innerText = 'unsupported'; statusEl.className = 'fw-status offline'; }
                     });
-                    videoEl.addEventListener('playing', () => {
-                        if (statusEl) { statusEl.innerText = 'live'; statusEl.className = 'fw-status live'; }
-                    }, { once: true });
-                    player.attachMediaElement(videoEl);
-                    player.load();
-                    player.play().catch(() => {});
                 }
 
-                // ---------- per-card map inset ----------
+                // ---------- per-card map inset (FOV wedge + red camel dots) ----------
                 function droneIcon(online) {
                     return L.divIcon({
                         className: '',
@@ -1197,6 +1442,9 @@ app.get('/fleet-wall', (req, res) => {
                     const lng = d.drone?.lng;
                     if (typeof lat !== 'number' || typeof lng !== 'number') return;
 
+                    const fovPts = fovPolygon(lat, lng, d.drone?.yaw, d.drone?.alt, d.fovDeg);
+                    const camels = Array.isArray(d.camels) ? d.camels : [];
+
                     if (!maps[id]) {
                         const map = L.map(mapEl, {
                             zoomControl: false,
@@ -1207,23 +1455,44 @@ app.get('/fleet-wall', (req, res) => {
                         }).setView([lat, lng], 17);
                         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
                         const marker = L.marker([lat, lng], { icon: droneIcon(isOnline(d)) }).addTo(map);
-                        maps[id] = { map, marker };
+                        const fov = L.polygon(fovPts, {
+                            color: '#5fd4d0', weight: 1, fillColor: '#5fd4d0', fillOpacity: 0.18, interactive: false
+                        }).addTo(map);
+                        const camelLayer = L.layerGroup().addTo(map);
+                        camels.forEach((c) => {
+                            if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                                L.circleMarker([c.lat, c.lng], {
+                                    radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
+                                }).addTo(camelLayer);
+                            }
+                        });
+                        maps[id] = { map, marker, fov, camelLayer };
                         // Tiles can render gray until the container has real layout dimensions.
                         requestAnimationFrame(() => map.invalidateSize());
                     } else {
                         maps[id].map.setView([lat, lng], maps[id].map.getZoom());
                         maps[id].marker.setLatLng([lat, lng]);
                         maps[id].marker.setIcon(droneIcon(isOnline(d)));
+                        maps[id].fov.setLatLngs(fovPts);
+                        maps[id].camelLayer.clearLayers();
+                        camels.forEach((c) => {
+                            if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                                L.circleMarker([c.lat, c.lng], {
+                                    radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
+                                }).addTo(maps[id].camelLayer);
+                            }
+                        });
                     }
                 }
 
                 // ---------- telemetry fields (shared by full card build + in-place update) ----------
                 function telemetryFieldsHTML(d) {
                     const hasFix = !!d.drone?.hasGPSFix && typeof d.drone?.lat === 'number';
+                    const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
                     return '<span>alt <b>' + fmtNum(d.drone?.alt, 1) + 'm</b></span>' +
                         '<span>yaw <b>' + fmtNum(d.drone?.yaw, 0) + '°</b></span>' +
                         '<span>gimbal <b>' + fmtNum(d.drone?.pitch, 0) + '°</b></span>' +
-                        '<span>🐫 <b class="accent">' + (Array.isArray(d.camels) ? d.camels.length : 0) + '</b></span>' +
+                        '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
                         '<span>gps <b class="' + (hasFix ? '' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
                         '<span>state <b class="' + (d.armed ? 'warn' : '') + '">' + (d.armed ? 'ARMED' : 'STANDBY') + '</b></span>';
                 }
@@ -1302,9 +1571,9 @@ app.get('/fleet-wall', (req, res) => {
                 }
 
                 // Cheap per-tick update: refreshes telemetry numbers, the armed
-                // dot, and the map marker position in place — never touches the
-                // video element, so a playing stream is never interrupted by an
-                // ordinary telemetry packet.
+                // dot, and the map marker/FOV/camel-dot positions in place —
+                // never touches the video element, so a playing stream is never
+                // interrupted by an ordinary telemetry packet.
                 function updateCardInPlace(id, d) {
                     const card = document.querySelector('.fw-card[data-id="' + id + '"]');
                     if (!card) return;
@@ -1349,11 +1618,7 @@ app.get('/fleet-wall', (req, res) => {
                     refresh(id);
                 }
 
-                fetch('/api/drones').then(r => r.json()).then((list) => {
-                    list.forEach((d) => applyUpdate({ ...d, drone: { lat: d.lat, lng: d.lng, yaw: d.yaw, pitch: d.pitch, alt: d.alt, hasGPSFix: d.hasGPSFix } }));
-                }).catch(() => {});
-
-                socket.on('telemetry_update', applyUpdate);
+                setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
 
                 // Periodic sweep to catch a drone going offline purely from the
                 // passage of time (no new packet needed to notice a timeout).
