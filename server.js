@@ -458,63 +458,6 @@ function sharedStyles() {
             color: var(--text-dim); min-height: 20px; flex: 0 0 auto;
         }
 
-        /* ---- video wall ---- */
-        .wall-wrap {
-            flex: 1 1 auto;
-            min-height: 0;
-            padding: 20px 28px 28px;
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-        .wall-toolbar {
-            display: flex; align-items: center; justify-content: space-between;
-            flex: 0 0 auto;
-        }
-        .wall-toolbar .count {
-            font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-dim);
-        }
-        .wall-grid {
-            flex: 1 1 auto;
-            min-height: 0;
-            display: grid;
-            gap: 14px;
-        }
-        .wall-empty {
-            flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
-            color: var(--text-faint); font-family: 'JetBrains Mono', monospace; font-size: 13px;
-            border: 1px dashed var(--border); border-radius: var(--radius);
-        }
-        .wall-tile {
-            position: relative;
-            background: #05070a;
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            overflow: hidden;
-            display: flex;
-            min-height: 0;
-        }
-        .wall-tile video { width: 100%; height: 100%; object-fit: cover; }
-        .wall-tile .tile-placeholder {
-            margin: auto; color: var(--text-faint); font-size: 12px;
-            font-family: 'JetBrains Mono', monospace; text-align: center; padding: 16px;
-        }
-        .wall-tile .tile-label {
-            position: absolute; left: 8px; top: 8px; z-index: 2;
-            background: rgba(13,17,23,0.72); backdrop-filter: blur(3px);
-            border: 1px solid var(--border); border-radius: 6px;
-            padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
-            display: flex; align-items: center; gap: 6px;
-        }
-        .wall-tile .tile-status {
-            position: absolute; right: 8px; top: 8px; z-index: 2;
-            font-family: 'JetBrains Mono', monospace; font-size: 10px;
-            padding: 3px 7px; border-radius: 10px; border: 1px solid var(--border);
-            background: rgba(13,17,23,0.72); color: var(--text-faint);
-        }
-        .wall-tile .tile-status.live { color: var(--green); border-color: var(--green); }
-        .wall-tile .tile-status.offline { color: var(--text-faint); }
-
         /* ---- fleet wall: per-drone card = video + map inset + telemetry strip ---- */
         .fw-wrap {
             flex: 1 1 auto;
@@ -536,8 +479,6 @@ function sharedStyles() {
             min-height: 0;
             overflow-y: auto;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-            grid-auto-rows: minmax(220px, 1fr);
             gap: 16px;
             align-content: start;
         }
@@ -546,49 +487,63 @@ function sharedStyles() {
             color: var(--text-faint); font-family: 'JetBrains Mono', monospace; font-size: 13px;
             border: 1px dashed var(--border); border-radius: var(--radius);
         }
+        /* Each card is a real flex column (title bar -> video box -> telemetry
+           strip), the same pattern the dashboard's Live Feed panel uses. The
+           video box gets flex:1 1 auto inside a column with a real pixel
+           height (from the grid row), so height:100% on <video> resolves to
+           an actual number instead of the 0px it was collapsing to when the
+           video sat inside a card that only had min-height set. */
         .fw-card {
-            position: relative;
-            aspect-ratio: 16 / 10;
-            background: #05070a;
+            display: flex;
+            flex-direction: column;
+            background: var(--panel);
             border: 1px solid var(--border);
             border-radius: var(--radius);
             overflow: hidden;
         }
-        .fw-card video { width: 100%; height: 100%; object-fit: cover; display: block; }
-        .fw-card .fw-placeholder {
-            position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-            color: var(--text-faint); font-size: 12px; font-family: 'JetBrains Mono', monospace;
-            text-align: center; padding: 16px;
+        .fw-card-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 8px 12px; border-bottom: 1px solid var(--border);
+            flex: 0 0 auto;
         }
-        .fw-card .fw-label {
-            position: absolute; left: 8px; top: 8px; z-index: 3;
-            background: rgba(13,17,23,0.72); backdrop-filter: blur(3px);
-            border: 1px solid var(--border); border-radius: 6px;
-            padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
+        .fw-card-header .fw-label {
             display: flex; align-items: center; gap: 6px;
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
         }
         .fw-card .fw-status {
-            position: absolute; right: 8px; top: 8px; z-index: 3;
             font-family: 'JetBrains Mono', monospace; font-size: 10px;
             padding: 3px 7px; border-radius: 10px; border: 1px solid var(--border);
-            background: rgba(13,17,23,0.72); color: var(--text-faint);
+            color: var(--text-faint);
         }
         .fw-card .fw-status.live { color: var(--green); border-color: var(--green); }
         .fw-card .fw-status.offline { color: var(--text-faint); }
+        .fw-video-box {
+            position: relative;
+            flex: 1 1 auto;
+            min-height: 0;
+            background: #05070a;
+            overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .fw-video-box video { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .fw-card .fw-placeholder {
+            color: var(--text-faint); font-size: 12px; font-family: 'JetBrains Mono', monospace;
+            text-align: center; padding: 16px;
+        }
         .fw-card .fw-map {
-            position: absolute; right: 8px; bottom: 40px; z-index: 3;
-            width: 130px; height: 110px;
+            position: absolute; right: 8px; bottom: 8px; z-index: 3;
+            width: 120px; height: 100px;
             border: 1px solid var(--border); border-radius: 6px;
             overflow: hidden;
             filter: saturate(0.35) brightness(0.85) contrast(1.05);
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
         }
         .fw-card .fw-telemetry {
-            position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
-            background: rgba(13,17,23,0.82); backdrop-filter: blur(4px);
+            flex: 0 0 auto;
+            background: var(--panel-raised);
             border-top: 1px solid var(--border);
             display: flex; gap: 14px; flex-wrap: wrap;
-            padding: 7px 10px;
+            padding: 7px 12px;
             font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
             color: var(--text-dim);
         }
@@ -613,7 +568,6 @@ function topBar(fleetCount, activeNav) {
             <div class="topbar-right">
                 ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
                 ${navLink('/fleet-wall', 'FLEET WALL', 'fleet-wall')}
-                ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
                 <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
                 <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
             </div>
@@ -1168,190 +1122,19 @@ app.get('/control', (req, res) => {
     res.redirect('/dashboard');
 });
 
-// ==========================================
-// 5b. VIDEO WALL — every connected drone's live feed at once
-// ==========================================
+// Old bookmark/link compatibility — video wall was merged into fleet wall.
 app.get('/video-wall', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>FFly Video Wall</title>
-            <script src="/socket.io/socket.io.js"></script>
-            <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
-            <style>${sharedStyles()}</style>
-        </head>
-        <body>
-            ${topBar(0, 'video-wall')}
-            <div class="wall-wrap">
-                <div class="wall-toolbar">
-                    <span class="count mono" id="wallCount">0 connections</span>
-                    <span class="count mono" id="wallLiveCount">0 live</span>
-                </div>
-                <div class="wall-grid" id="wallGrid"></div>
-                <div class="wall-empty" id="wallEmpty">Waiting for drones to connect…</div>
-            </div>
-
-            <script>
-                ${clientCoreScript()}
-
-                const dronesById = {};   // droneId -> latest telemetry record
-                const players = {};      // droneId -> live player wrapper from createLivePlayer
-                const renderState = {};  // droneId -> {online, live} as of the last DOM rebuild
-                const OFFLINE_AFTER_MS = 15000;
-
-                function isOnline(d) {
-                    return (Date.now() - (d.lastUpdate || 0)) < OFFLINE_AFTER_MS;
-                }
-
-                function computeState(d) {
-                    const online = isOnline(d);
-                    return { online, live: !!d.isLive && online };
-                }
-
-                function statesEqual(a, b) {
-                    return !!a && !!b && a.online === b.online && a.live === b.live;
-                }
-
-                function columnsFor(n) {
-                    if (n <= 1) return 1;
-                    return Math.ceil(Math.sqrt(n));
-                }
-
-                function destroyPlayer(id) {
-                    if (players[id]) { players[id].destroy(); delete players[id]; }
-                }
-
-                function startPlayer(id, streamKey, videoEl, statusEl) {
-                    destroyPlayer(id);
-                    players[id] = createLivePlayer(streamKey, videoEl, (status) => {
-                        if (!statusEl) return;
-                        if (status === 'live') { statusEl.innerText = 'live'; statusEl.className = 'tile-status live'; }
-                        else if (status === 'retrying' || status === 'recovering') { statusEl.innerText = status === 'recovering' ? 'reconnecting' : 'retrying'; statusEl.className = 'tile-status offline'; }
-                        else if (status === 'unsupported') { statusEl.innerText = 'unsupported'; statusEl.className = 'tile-status offline'; }
-                    });
-                }
-
-                function tileHTML(id, d) {
-                    const online = isOnline(d);
-                    const live = !!d.isLive && online;
-                    return '<div class="wall-tile" data-id="' + id + '">' +
-                        '<div class="tile-label"><span class="dot ' + (online ? 'online' : 'offline') + '"></span>' + (d.name || id) + '</div>' +
-                        '<span class="tile-status ' + (live ? 'live' : 'offline') + '" id="status-' + id + '">' + (live ? 'connecting' : (online ? 'no stream' : 'offline')) + '</span>' +
-                        (live ? '<video id="video-' + id + '" muted playsinline></video>' : '<div class="tile-placeholder">' + (online ? 'Connected — not streaming' : 'No signal') + '</div>') +
-                    '</div>';
-                }
-
-                // Rebuilds the whole grid. Only called when a drone joins/leaves
-                // or its online/live status actually changes — never on a plain
-                // telemetry tick — so a playing video is never torn down and
-                // reconnected just because a position update came in.
-                function renderGrid() {
-                    const ids = Object.keys(dronesById);
-                    const grid = document.getElementById('wallGrid');
-                    const empty = document.getElementById('wallEmpty');
-
-                    if (ids.length === 0) {
-                        grid.style.display = 'none';
-                        empty.style.display = 'flex';
-                        Object.keys(players).forEach(destroyPlayer);
-                        Object.keys(renderState).forEach((id) => delete renderState[id]);
-                        updateCounts();
-                        return;
-                    }
-                    grid.style.display = 'grid';
-                    empty.style.display = 'none';
-
-                    const cols = columnsFor(ids.length);
-                    const rows = Math.ceil(ids.length / cols);
-                    grid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
-                    grid.style.gridTemplateRows = 'repeat(' + rows + ', 1fr)';
-
-                    grid.innerHTML = ids.map((id) => tileHTML(id, dronesById[id])).join('');
-
-                    Object.keys(players).forEach((id) => {
-                        if (!dronesById[id] || !dronesById[id].isLive || !isOnline(dronesById[id])) destroyPlayer(id);
-                    });
-
-                    ids.forEach((id) => {
-                        const d = dronesById[id];
-                        if (d.isLive && isOnline(d) && !players[id]) {
-                            const videoEl = document.getElementById('video-' + id);
-                            const statusEl = document.getElementById('status-' + id);
-                            if (videoEl) startPlayer(id, d.streamKey || id, videoEl, statusEl);
-                        }
-                        renderState[id] = computeState(d);
-                    });
-
-                    Object.keys(renderState).forEach((id) => { if (!dronesById[id]) delete renderState[id]; });
-
-                    updateCounts();
-                }
-
-                function updateCounts() {
-                    const ids = Object.keys(dronesById);
-                    document.getElementById('wallCount').innerText = ids.length + ' connection' + (ids.length === 1 ? '' : 's');
-                    const liveCount = ids.filter((id) => dronesById[id].isLive && isOnline(dronesById[id])).length;
-                    document.getElementById('wallLiveCount').innerText = liveCount + ' live';
-                    const countEl = document.getElementById('fleetCount');
-                    if (countEl) countEl.innerText = ids.length;
-                }
-
-                // Cheap per-tick update: only refreshes the drone's name label
-                // in place. Anything that affects layout (online/live/new/gone)
-                // goes through renderGrid() instead.
-                function updateTileInPlace(id, d) {
-                    const tile = document.querySelector('.wall-tile[data-id="' + id + '"]');
-                    if (!tile) return;
-                    const label = tile.querySelector('.tile-label');
-                    if (label && label.lastChild && label.lastChild.nodeType === Node.TEXT_NODE) {
-                        label.lastChild.textContent = d.name || id;
-                    }
-                }
-
-                // Decides whether this update needs a full grid rebuild (a
-                // drone's online/live status changed, or it's new) or just a
-                // lightweight in-place refresh — this is what stops the video
-                // from being torn down and reconnected on every telemetry packet.
-                function refresh(id) {
-                    const d = dronesById[id];
-                    if (!d) return;
-                    const newState = computeState(d);
-                    const isNew = !(id in renderState);
-                    if (isNew || !statesEqual(renderState[id], newState)) {
-                        renderGrid();
-                    } else {
-                        updateTileInPlace(id, d);
-                        updateCounts();
-                    }
-                }
-
-                function applyUpdate(data) {
-                    const id = data.droneId || 'drone-1';
-                    dronesById[id] = data;
-                    refresh(id);
-                }
-
-                setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
-
-                // Periodic sweep to catch a drone going offline purely from the
-                // passage of time (no new packet needed to notice a timeout).
-                // Uses the same change-detection as refresh(), so it still won't
-                // touch a live video unless a status actually flipped.
-                setInterval(() => {
-                    Object.keys(dronesById).forEach(refresh);
-                }, 5000);
-            </script>
-        </body>
-        </html>
-    `);
+    res.redirect('/fleet-wall');
 });
 
 // ==========================================
-// 5c. FLEET WALL — one page, one card per drone: video + map inset + telemetry strip
-// No shared map. Same flv.js live-video system as the dashboard/video-wall pages.
+// 5b. FLEET WALL — one page, one card per drone: video + map inset + telemetry strip
+// Every connected drone gets its own tile with its own live flv.js player
+// (same stall-recovery wrapper as the dashboard) and its own small map
+// inset showing position + FOV wedge + tracked camels. Cards are laid out
+// in an explicit CSS grid (not auto-fit) sized to the current drone count,
+// so multiple simultaneous videos always render side by side instead of
+// collapsing or overlapping.
 // ==========================================
 app.get('/fleet-wall', (req, res) => {
     res.send(`
@@ -1385,10 +1168,32 @@ app.get('/fleet-wall', (req, res) => {
                 const players = {};      // droneId -> live player wrapper from createLivePlayer
                 const maps = {};         // droneId -> { map, marker, fov, camelLayer }
                 const renderState = {};  // droneId -> {online, live, hasFix} as of the last DOM rebuild
+                const cardEls = {};      // droneId -> cached element references for this card (see cacheCardEls)
                 const OFFLINE_AFTER_MS = 15000;
 
                 function fmtNum(n, digits) {
                     return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
+                }
+
+                // Turns an arbitrary droneId (which may contain spaces, slashes,
+                // or other characters some DJI apps send in a device name) into
+                // a safe string for use in an HTML id attribute. Two different
+                // real droneIds could otherwise map to colliding DOM ids, or a
+                // stray character could produce invalid markup — either of
+                // which can throw partway through building the grid and take
+                // every other drone's card down with it.
+                function safeId(id) {
+                    return 'd_' + String(id).replace(/[^a-zA-Z0-9_-]/g, '_');
+                }
+
+                // Explicit column count for the current drone count, so cards
+                // never collapse to zero width or overlap when several drones
+                // are streaming video at once. 1 -> 1 col, 2-4 -> 2 cols,
+                // beyond that -> roughly square grid.
+                function columnsFor(n) {
+                    if (n <= 1) return 1;
+                    if (n <= 4) return 2;
+                    return Math.ceil(Math.sqrt(n));
                 }
 
                 function isOnline(d) {
@@ -1407,17 +1212,32 @@ app.get('/fleet-wall', (req, res) => {
 
                 // ---------- video (shared flv.js wrapper with the stall fix) ----------
                 function destroyPlayer(id) {
-                    if (players[id]) { players[id].destroy(); delete players[id]; }
+                    try {
+                        if (players[id]) players[id].destroy();
+                    } catch (e) {
+                        console.error('[fleet-wall] error destroying player for', id, e);
+                    } finally {
+                        delete players[id];
+                    }
                 }
 
+                // Wrapped so that a bad stream (missing key, unreachable host,
+                // whatever flv.js chokes on for THIS drone) can never throw out
+                // of the render loop and abort processing of every other card.
                 function startPlayer(id, streamKey, videoEl, statusEl) {
                     destroyPlayer(id);
-                    players[id] = createLivePlayer(streamKey, videoEl, (status) => {
-                        if (!statusEl) return;
-                        if (status === 'live') { statusEl.innerText = 'live'; statusEl.className = 'fw-status live'; }
-                        else if (status === 'retrying' || status === 'recovering') { statusEl.innerText = status === 'recovering' ? 'reconnecting' : 'retrying'; statusEl.className = 'fw-status offline'; }
-                        else if (status === 'unsupported') { statusEl.innerText = 'unsupported'; statusEl.className = 'fw-status offline'; }
-                    });
+                    try {
+                        players[id] = createLivePlayer(streamKey, videoEl, (status) => {
+                            if (!statusEl) return;
+                            if (status === 'live') { statusEl.innerText = 'live'; statusEl.className = 'fw-status live'; }
+                            else if (status === 'retrying' || status === 'recovering') { statusEl.innerText = status === 'recovering' ? 'reconnecting' : 'retrying'; statusEl.className = 'fw-status offline'; }
+                            else if (status === 'unsupported') { statusEl.innerText = 'unsupported'; statusEl.className = 'fw-status offline'; }
+                            else if (status === 'tap to play') { statusEl.innerText = 'tap to play'; statusEl.className = 'fw-status offline'; }
+                        });
+                    } catch (e) {
+                        console.error('[fleet-wall] failed to start player for', id, streamKey, e);
+                        if (statusEl) { statusEl.innerText = 'error'; statusEl.className = 'fw-status offline'; }
+                    }
                 }
 
                 // ---------- per-card map inset (FOV wedge + red camel dots) ----------
@@ -1437,51 +1257,59 @@ app.get('/fleet-wall', (req, res) => {
                     delete maps[id];
                 }
 
+                // Wrapped for the same reason as startPlayer — a malformed
+                // lat/lng or a Leaflet edge case for one drone must not stop
+                // the map insets or video for any other drone from rendering.
                 function ensureMap(id, d, mapEl) {
-                    const lat = d.drone?.lat;
-                    const lng = d.drone?.lng;
-                    if (typeof lat !== 'number' || typeof lng !== 'number') return;
+                    try {
+                        const lat = d.drone?.lat;
+                        const lng = d.drone?.lng;
+                        if (typeof lat !== 'number' || typeof lng !== 'number') return;
 
-                    const fovPts = fovPolygon(lat, lng, d.drone?.yaw, d.drone?.alt, d.fovDeg);
-                    const camels = Array.isArray(d.camels) ? d.camels : [];
+                        const fovPts = fovPolygon(lat, lng, d.drone?.yaw, d.drone?.alt, d.fovDeg);
+                        const camels = Array.isArray(d.camels) ? d.camels : [];
 
-                    if (!maps[id]) {
-                        const map = L.map(mapEl, {
-                            zoomControl: false,
-                            dragging: false,
-                            scrollWheelZoom: false,
-                            doubleClickZoom: false,
-                            attributionControl: false
-                        }).setView([lat, lng], 17);
-                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
-                        const marker = L.marker([lat, lng], { icon: droneIcon(isOnline(d)) }).addTo(map);
-                        const fov = L.polygon(fovPts, {
-                            color: '#5fd4d0', weight: 1, fillColor: '#5fd4d0', fillOpacity: 0.18, interactive: false
-                        }).addTo(map);
-                        const camelLayer = L.layerGroup().addTo(map);
-                        camels.forEach((c) => {
-                            if (typeof c.lat === 'number' && typeof c.lng === 'number') {
-                                L.circleMarker([c.lat, c.lng], {
-                                    radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
-                                }).addTo(camelLayer);
-                            }
-                        });
-                        maps[id] = { map, marker, fov, camelLayer };
-                        // Tiles can render gray until the container has real layout dimensions.
-                        requestAnimationFrame(() => map.invalidateSize());
-                    } else {
-                        maps[id].map.setView([lat, lng], maps[id].map.getZoom());
-                        maps[id].marker.setLatLng([lat, lng]);
-                        maps[id].marker.setIcon(droneIcon(isOnline(d)));
-                        maps[id].fov.setLatLngs(fovPts);
-                        maps[id].camelLayer.clearLayers();
-                        camels.forEach((c) => {
-                            if (typeof c.lat === 'number' && typeof c.lng === 'number') {
-                                L.circleMarker([c.lat, c.lng], {
-                                    radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
-                                }).addTo(maps[id].camelLayer);
-                            }
-                        });
+                        if (!maps[id]) {
+                            const map = L.map(mapEl, {
+                                zoomControl: false,
+                                dragging: false,
+                                scrollWheelZoom: false,
+                                doubleClickZoom: false,
+                                attributionControl: false
+                            }).setView([lat, lng], 17);
+                            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
+                            const marker = L.marker([lat, lng], { icon: droneIcon(isOnline(d)) }).addTo(map);
+                            const fov = L.polygon(fovPts, {
+                                color: '#5fd4d0', weight: 1, fillColor: '#5fd4d0', fillOpacity: 0.18, interactive: false
+                            }).addTo(map);
+                            const camelLayer = L.layerGroup().addTo(map);
+                            camels.forEach((c) => {
+                                if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                                    L.circleMarker([c.lat, c.lng], {
+                                        radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
+                                    }).addTo(camelLayer);
+                                }
+                            });
+                            maps[id] = { map, marker, fov, camelLayer };
+                            // Tiles can render gray until the container has real layout dimensions.
+                            requestAnimationFrame(() => { try { map.invalidateSize(); } catch (e) {} });
+                            setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 250);
+                        } else {
+                            maps[id].map.setView([lat, lng], maps[id].map.getZoom());
+                            maps[id].marker.setLatLng([lat, lng]);
+                            maps[id].marker.setIcon(droneIcon(isOnline(d)));
+                            maps[id].fov.setLatLngs(fovPts);
+                            maps[id].camelLayer.clearLayers();
+                            camels.forEach((c) => {
+                                if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                                    L.circleMarker([c.lat, c.lng], {
+                                        radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
+                                    }).addTo(maps[id].camelLayer);
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        console.error('[fleet-wall] error rendering map for', id, e);
                     }
                 }
 
@@ -1498,23 +1326,63 @@ app.get('/fleet-wall', (req, res) => {
                 }
 
                 // ---------- card markup ----------
+                // Mirrors the dashboard's Live Feed panel: the <video> element
+                // is ALWAYS in the DOM (never conditionally left out), and a
+                // placeholder overlay is just hidden/shown on top of it. Names
+                // go into a plain text span (escaped via textContent later, not
+                // concatenated raw) and every dynamic element uses the sanitized
+                // safeId() so no drone's name/id can produce invalid or
+                // colliding markup.
                 function cardHTML(id, d) {
+                    const sid = safeId(id);
                     const online = isOnline(d);
                     const live = !!d.isLive && online;
                     const hasFix = !!d.drone?.hasGPSFix && typeof d.drone?.lat === 'number';
-                    return '<div class="fw-card" data-id="' + id + '">' +
-                        '<div class="fw-label"><span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' + (d.name || id) + '</div>' +
-                        '<span class="fw-status ' + (live ? 'live' : 'offline') + '" id="fwstatus-' + id + '">' + (live ? 'connecting' : (online ? 'no stream' : 'offline')) + '</span>' +
-                        (live ? '<video id="fwvideo-' + id + '" muted playsinline></video>' : '<div class="fw-placeholder">' + (online ? 'Connected — not streaming' : 'No signal') + '</div>') +
-                        (hasFix ? '<div class="fw-map" id="fwmap-' + id + '"></div>' : '') +
-                        '<div class="fw-telemetry">' + telemetryFieldsHTML(d) + '</div>' +
+                    const displayName = String(d.name || id).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+                    return '<div class="fw-card" data-id="' + sid + '">' +
+                        '<div class="fw-card-header">' +
+                            '<div class="fw-label"><span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span><span class="fw-name">' + displayName + '</span></div>' +
+                            '<span class="fw-status ' + (live ? 'live' : 'offline') + '" id="fwstatus-' + sid + '">' + (live ? 'connecting' : (online ? 'no stream' : 'offline')) + '</span>' +
+                        '</div>' +
+                        '<div class="fw-video-box">' +
+                            '<video id="fwvideo-' + sid + '" muted playsinline autoplay style="display:' + (live ? 'block' : 'none') + ';"></video>' +
+                            '<div class="fw-placeholder" id="fwplaceholder-' + sid + '" style="display:' + (live ? 'none' : 'block') + ';">' + (online ? 'Connected — not streaming' : 'No signal') + '</div>' +
+                            (hasFix ? '<div class="fw-map" id="fwmap-' + sid + '"></div>' : '') +
+                        '</div>' +
+                        '<div class="fw-telemetry" id="fwtelemetry-' + sid + '">' + telemetryFieldsHTML(d) + '</div>' +
                     '</div>';
+                }
+
+                // After the grid's innerHTML is set, this grabs and caches a
+                // direct element reference for every drone's card pieces.
+                // Using getElementById once here (instead of re-querying the
+                // DOM by concatenated id/selector strings on every update)
+                // means later code never has to worry about id escaping and
+                // never silently no-ops because a lookup string didn't match.
+                function cacheCardEls(id) {
+                    const sid = safeId(id);
+                    cardEls[id] = {
+                        root: document.querySelector('.fw-card[data-id="' + sid + '"]'),
+                        video: document.getElementById('fwvideo-' + sid),
+                        placeholder: document.getElementById('fwplaceholder-' + sid),
+                        status: document.getElementById('fwstatus-' + sid),
+                        map: document.getElementById('fwmap-' + sid),
+                        telemetry: document.getElementById('fwtelemetry-' + sid)
+                    };
                 }
 
                 // Rebuilds the whole grid. Only called when a drone joins/leaves,
                 // or its online/live/GPS-fix status changes — never on a plain
                 // telemetry tick — so a playing video is never torn down and
-                // reconnected just because a position update came in.
+                // reconnected just because a position update came in. Also
+                // sets an explicit column/row count sized to the drone count,
+                // so multiple simultaneous videos always lay out side by side.
+                //
+                // Every per-drone step (video start, map render) is wrapped in
+                // its own try/catch inside the loop below, so a failure for one
+                // drone (bad stream key, malformed telemetry, whatever) is
+                // logged and skipped instead of throwing out of the forEach and
+                // silently aborting setup for every drone processed after it.
                 function renderGrid() {
                     const ids = Object.keys(dronesById);
                     const grid = document.getElementById('fwGrid');
@@ -1526,13 +1394,26 @@ app.get('/fleet-wall', (req, res) => {
                         Object.keys(players).forEach(destroyPlayer);
                         Object.keys(maps).forEach(destroyMap);
                         Object.keys(renderState).forEach((id) => delete renderState[id]);
+                        Object.keys(cardEls).forEach((id) => delete cardEls[id]);
                         updateCounts();
                         return;
                     }
                     grid.style.display = 'grid';
                     empty.style.display = 'none';
 
-                    grid.innerHTML = ids.map((id) => cardHTML(id, dronesById[id])).join('');
+                    const cols = columnsFor(ids.length);
+                    const rows = Math.ceil(ids.length / cols);
+                    grid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+                    grid.style.gridTemplateRows = 'repeat(' + rows + ', minmax(220px, 1fr))';
+
+                    grid.innerHTML = ids.map((id) => {
+                        try {
+                            return cardHTML(id, dronesById[id]);
+                        } catch (e) {
+                            console.error('[fleet-wall] failed to build card for', id, e);
+                            return '';
+                        }
+                    }).join('');
 
                     Object.keys(players).forEach((id) => {
                         if (!dronesById[id] || !dronesById[id].isLive || !isOnline(dronesById[id])) destroyPlayer(id);
@@ -1542,21 +1423,26 @@ app.get('/fleet-wall', (req, res) => {
                     });
 
                     ids.forEach((id) => {
-                        const d = dronesById[id];
+                        try {
+                            cacheCardEls(id);
+                            const d = dronesById[id];
+                            const els = cardEls[id];
+                            if (!els || !els.root) return; // this card's HTML failed to build; skip it, don't touch others
 
-                        if (d.isLive && isOnline(d) && !players[id]) {
-                            const videoEl = document.getElementById('fwvideo-' + id);
-                            const statusEl = document.getElementById('fwstatus-' + id);
-                            if (videoEl) startPlayer(id, d.streamKey || id, videoEl, statusEl);
+                            if (d.isLive && isOnline(d) && !players[id] && els.video) {
+                                startPlayer(id, d.streamKey || id, els.video, els.status);
+                            }
+
+                            if (els.map) ensureMap(id, d, els.map);
+
+                            renderState[id] = computeState(d);
+                        } catch (e) {
+                            console.error('[fleet-wall] error setting up card for', id, e);
                         }
-
-                        const mapEl = document.getElementById('fwmap-' + id);
-                        if (mapEl) ensureMap(id, d, mapEl);
-
-                        renderState[id] = computeState(d);
                     });
 
                     Object.keys(renderState).forEach((id) => { if (!dronesById[id]) delete renderState[id]; });
+                    Object.keys(cardEls).forEach((id) => { if (!dronesById[id]) delete cardEls[id]; });
 
                     updateCounts();
                 }
@@ -1573,25 +1459,28 @@ app.get('/fleet-wall', (req, res) => {
                 // Cheap per-tick update: refreshes telemetry numbers, the armed
                 // dot, and the map marker/FOV/camel-dot positions in place —
                 // never touches the video element, so a playing stream is never
-                // interrupted by an ordinary telemetry packet.
+                // interrupted by an ordinary telemetry packet. Uses the cached
+                // element references from cacheCardEls instead of re-querying
+                // the DOM, and is wrapped so a bad update for one drone can't
+                // break the periodic sweep for the rest of the fleet.
                 function updateCardInPlace(id, d) {
-                    const card = document.querySelector('.fw-card[data-id="' + id + '"]');
-                    if (!card) return;
+                    try {
+                        const els = cardEls[id];
+                        if (!els || !els.root) { renderGrid(); return; }
 
-                    const online = isOnline(d);
-                    const dot = card.querySelector('.fw-label .dot');
-                    if (dot) dot.className = 'dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline');
+                        const online = isOnline(d);
+                        const dot = els.root.querySelector('.fw-label .dot');
+                        if (dot) dot.className = 'dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline');
 
-                    const label = card.querySelector('.fw-label');
-                    if (label && label.lastChild && label.lastChild.nodeType === Node.TEXT_NODE) {
-                        label.lastChild.textContent = d.name || id;
+                        const nameEl = els.root.querySelector('.fw-name');
+                        if (nameEl) nameEl.textContent = d.name || id;
+
+                        if (els.telemetry) els.telemetry.innerHTML = telemetryFieldsHTML(d);
+
+                        if (els.map) ensureMap(id, d, els.map);
+                    } catch (e) {
+                        console.error('[fleet-wall] error updating card in place for', id, e);
                     }
-
-                    const telemetry = card.querySelector('.fw-telemetry');
-                    if (telemetry) telemetry.innerHTML = telemetryFieldsHTML(d);
-
-                    const mapEl = document.getElementById('fwmap-' + id);
-                    if (mapEl) ensureMap(id, d, mapEl);
                 }
 
                 // Decides whether this update needs a full grid rebuild (a
@@ -1615,7 +1504,11 @@ app.get('/fleet-wall', (req, res) => {
                 function applyUpdate(data) {
                     const id = data.droneId || 'drone-1';
                     dronesById[id] = data;
-                    refresh(id);
+                    try {
+                        refresh(id);
+                    } catch (e) {
+                        console.error('[fleet-wall] error applying update for', id, e);
+                    }
                 }
 
                 setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
@@ -1625,8 +1518,16 @@ app.get('/fleet-wall', (req, res) => {
                 // Uses the same change-detection as refresh(), so it still
                 // won't touch a live video unless a status actually flipped.
                 setInterval(() => {
-                    Object.keys(dronesById).forEach(refresh);
+                    Object.keys(dronesById).forEach((id) => {
+                        try { refresh(id); } catch (e) { console.error('[fleet-wall] error in periodic refresh for', id, e); }
+                    });
                 }, 5000);
+
+                // Recompute map sizing on window resize so insets in a
+                // multi-column grid stay correctly rendered.
+                window.addEventListener('resize', () => {
+                    Object.values(maps).forEach((m) => { try { m.map.invalidateSize(); } catch (e) {} });
+                });
             </script>
         </body>
         </html>
@@ -1644,6 +1545,5 @@ server.listen(PORT, () => {
     console.log(`- HTTP-FLV stream: http://localhost:8000/live/<droneId>.flv`);
     console.log(`- Dashboard (map + control + live + telemetry): http://localhost:3000/dashboard`);
     console.log(`- Fleet wall (per-drone card: video + map + telemetry): http://localhost:3000/fleet-wall`);
-    console.log(`- Video wall (all live feeds): http://localhost:3000/video-wall`);
     console.log(`============================================`);
 });
