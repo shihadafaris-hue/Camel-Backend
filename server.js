@@ -89,6 +89,7 @@ function fleetSummary() {
             alt: d.drone?.alt ?? 0,
             yaw: d.drone?.yaw ?? 0,
             pitch: d.drone?.pitch ?? 0,
+            roll: d.drone?.roll ?? 0,
             hasGPSFix: !!d.drone?.hasGPSFix,
             camelCount: Array.isArray(d.camels) ? d.camels.length : 0,
             camels, // full positions (may be empty even if camelCount > 0)
@@ -107,7 +108,7 @@ function fleetSummary() {
 // ==========================================
 // Body shape (droneId optional, defaults to "drone-1" for single-drone setups):
 // { droneId, name, clientTimestamp,
-//   drone: {lat,lng,yaw,pitch,alt,hasGPSFix},
+//   drone: {lat,lng,yaw,pitch,roll,alt,hasGPSFix},
 //   camera: { fovDeg },                      // optional, defaults to 78
 //   camels: [{id,lat,lng,confidence}, ...],  // positions, OR a bare count
 //   isLive, streamKey, armed }
@@ -134,7 +135,9 @@ app.post('/api/telemetry', (req, res) => {
     // Emit the normalized shape (with camels positions + fovDeg resolved) so
     // every connected client — including ones that just reconnected — gets
     // a consistent record, whether it came from a live socket push or a
-    // fresh /api/drones fetch after a page refresh.
+    // fresh /api/drones fetch after a page refresh. This SAME event feeds
+    // the Dashboard, the Video Wall, and the Map Wall, so all three pages
+    // always agree on position, FOV, camels, and stream key.
     const emitRecord = {
         ...record,
         camels: normalizeCamels(record.camels),
@@ -150,10 +153,11 @@ app.post('/api/telemetry', (req, res) => {
     });
 });
 
-// Snapshot of the whole fleet — used by the dashboard on load,
-// before any live socket events have arrived, AND used as a periodic
-// resync safety net by the client so a dropped socket event (or a page
-// refresh that races a slow first fetch) never makes a drone "disappear".
+// Snapshot of the whole fleet — used by every page (dashboard, video wall,
+// map wall) on load, before any live socket events have arrived, AND used
+// as a periodic resync safety net by the client so a dropped socket event
+// (or a page refresh that races a slow first fetch) never makes a drone
+// "disappear" from any of the three views.
 app.get('/api/drones', (req, res) => {
     res.status(200).json(fleetSummary());
 });
@@ -183,6 +187,28 @@ app.post('/api/control/:droneId', (req, res) => {
     if (command === 'ARM' && drones[droneId]) drones[droneId].armed = true;
     if ((command === 'DISARM' || command === 'EMERGENCY_STOP') && drones[droneId]) drones[droneId].armed = false;
 
+    // Optimistically apply gimbal/yaw commands to the cached telemetry record
+    // and re-broadcast immediately. Without this, the FOV cone on every map
+    // (Dashboard, Video Wall inset, Map Wall) only moves once the physical
+    // drone reports its new pitch/yaw back over telemetry — which can lag or
+    // never happen in a bench/simulated setup. This makes the cone track the
+    // commanded pitch/yaw right away; a later real telemetry packet just
+    // overwrites it with the ground-truth value as usual.
+    if (drones[droneId]) {
+        drones[droneId].drone = drones[droneId].drone || {};
+        if (command === 'SET_GIMBAL' && params && typeof params.pitchDeg === 'number') {
+            drones[droneId].drone.pitch = params.pitchDeg;
+        }
+        if (command === 'SET_YAW' && params) {
+            if (typeof params.absolute === 'number') {
+                drones[droneId].drone.yaw = ((params.absolute % 360) + 360) % 360;
+            } else if (typeof params.relative === 'number') {
+                const current = drones[droneId].drone.yaw || 0;
+                drones[droneId].drone.yaw = ((current + params.relative) % 360 + 360) % 360;
+            }
+        }
+    }
+
     const logEntry = `[${new Date().toISOString()}] [${droneId}] ${command} ${params ? JSON.stringify(params) : ''}\n`;
     fs.appendFile(CONTROL_LOG_FILE, logEntry, (err) => {
         if (err) console.error('Failed to write to control log file:', err);
@@ -190,6 +216,20 @@ app.post('/api/control/:droneId', (req, res) => {
 
     const payload = { droneId, commandId: state.commandId, command, params: state.params, updatedAt: state.updatedAt };
     io.emit('control_command', payload);
+
+    // Re-broadcast the updated telemetry snapshot (normalized the same way
+    // /api/telemetry does) so every connected page's FOV cone moves the
+    // instant a gimbal/yaw command is issued, not just on the next real
+    // telemetry tick.
+    if (drones[droneId] && (command === 'SET_GIMBAL' || command === 'SET_YAW')) {
+        const rec = drones[droneId];
+        io.emit('telemetry_update', {
+            ...rec,
+            camels: normalizeCamels(rec.camels),
+            camelCount: Array.isArray(rec.camels) ? rec.camels.length : 0,
+            fovDeg: (typeof rec.camera?.fovDeg === 'number') ? rec.camera.fovDeg : DEFAULT_FOV_DEG
+        });
+    }
 
     res.status(200).json(payload);
 });
@@ -385,7 +425,7 @@ function sharedStyles() {
         }
         @media (max-width: 980px) { .quad { grid-template-columns: 1fr; grid-template-rows: repeat(4, minmax(220px, 1fr)); overflow-y: auto; } }
 
-        #map { flex: 1 1 auto; min-height: 0; width: 100%; border-radius: 0 0 var(--radius) var(--radius); filter: saturate(0.35) brightness(0.85) contrast(1.05); }
+        #map, #mwMap { flex: 1 1 auto; min-height: 0; width: 100%; border-radius: 0 0 var(--radius) var(--radius); }
 
         .map-legend {
             position: absolute; left: 8px; bottom: 8px; z-index: 500;
@@ -458,7 +498,7 @@ function sharedStyles() {
             color: var(--text-dim); min-height: 20px; flex: 0 0 auto;
         }
 
-        /* ---- fleet wall: per-drone card = video + map inset + telemetry strip ---- */
+        /* ---- video wall: per-drone card = video + map inset + telemetry strip ---- */
         .fw-wrap {
             flex: 1 1 auto;
             min-height: 0;
@@ -535,7 +575,6 @@ function sharedStyles() {
             width: 120px; height: 100px;
             border: 1px solid var(--border); border-radius: 6px;
             overflow: hidden;
-            filter: saturate(0.35) brightness(0.85) contrast(1.05);
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
         }
         .fw-card .fw-telemetry {
@@ -550,6 +589,18 @@ function sharedStyles() {
         .fw-card .fw-telemetry b { color: var(--text); font-weight: 600; }
         .fw-card .fw-telemetry .warn { color: var(--amber); }
         .fw-card .fw-telemetry .accent { color: var(--cyan); }
+
+        /* ---- map wall ---- */
+        .mw-layout {
+            flex: 1 1 auto;
+            min-height: 0;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+            padding: 20px 28px 28px;
+        }
+        .mw-popup { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; }
+        .mw-popup b { color: #0d1117; }
     `;
 }
 
@@ -567,7 +618,8 @@ function topBar(fleetCount, activeNav) {
             </div>
             <div class="topbar-right">
                 ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
-                ${navLink('/fleet-wall', 'FLEET WALL', 'fleet-wall')}
+                ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
+                ${navLink('/map-wall', 'MAP WALL', 'map-wall')}
                 <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
                 <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
             </div>
@@ -578,15 +630,20 @@ function topBar(fleetCount, activeNav) {
 // ==========================================
 // 4b. SHARED CLIENT-SIDE HELPERS
 // Inlined into every page's <script> block so there is one source of
-// truth for: geo math (FOV cone / destination-point), the flv.js player
-// wrapper (with the long-flight stall fix), and the socket/connection
-// resync logic (the "drone disappears on refresh" fix).
+// truth for: geo math (destination-point + the precise camera-frustum FOV
+// footprint ported from map_html_gen.py), the flv.js player wrapper (with
+// the long-flight stall fix), and the socket/connection resync logic (the
+// "drone disappears on refresh" fix). Every page — Dashboard, Video Wall,
+// Map Wall — includes this same block, so all three always compute the
+// same FOV footprint from the same telemetry and connect to the same RTMP
+// stream key.
 // ==========================================
 function clientCoreScript() {
     return `
         // ---------- geo math ----------
         // Great-circle destination point given a start point, bearing, and
-        // distance — used to draw the drone's camera FOV footprint on the map.
+        // distance — used as a fallback when we only have a bare fovDeg (no
+        // gimbal pitch/roll) to draw with.
         function destPoint(lat, lng, bearingDeg, distanceM) {
             const R = 6378137;
             const brng = bearingDeg * Math.PI / 180;
@@ -601,9 +658,8 @@ function clientCoreScript() {
             return [lat2 * 180 / Math.PI, lng2 * 180 / Math.PI];
         }
 
-        // Builds a wedge (apex + arc) representing the drone's ground FOV,
-        // centered on its heading (yaw). Radius scales with altitude so the
-        // footprint grows as the drone climbs.
+        // Simple wedge fallback (apex + arc), centered on heading (yaw).
+        // Used only if preciseFovPolygon can't run (e.g. missing altitude).
         function fovPolygon(lat, lng, yawDeg, altM, fovDeg) {
             const radius = Math.max(15, (altM || 10) * 2.2);
             const half = (fovDeg || 78) / 2;
@@ -615,6 +671,111 @@ function clientCoreScript() {
             }
             pts.push([lat, lng]);
             return pts;
+        }
+
+        // ---------- precise camera-frustum FOV footprint ----------
+        // Ported directly from map_html_gen.py's calculate_fov_polygon /
+        // calculate_frustum_vectors / get_rotation_matrix / add_meters_to_latlon.
+        // Uses the DJI Mini 5 Pro's real sensor width/height and focal length
+        // to build the camera frustum, rotates it by yaw/pitch/roll, and
+        // ray-intersects each corner with the ground plane at the drone's
+        // altitude — a true footprint instead of a flat wedge. Used by the
+        // Dashboard map, the Video Wall's per-card map inset, and the Map
+        // Wall.
+        const FOV_SENSOR_WIDTH_MM = 13.2;   // 1-inch sensor width
+        const FOV_SENSOR_HEIGHT_MM = 8.8;   // 1-inch sensor height
+        const FOV_FOCAL_LENGTH_MM = 8.8;    // true focal length for 24mm equiv on 1" sensor
+        const FOV_H_DEG = 2 * Math.atan((FOV_SENSOR_WIDTH_MM / 2) / FOV_FOCAL_LENGTH_MM) * 180 / Math.PI;
+        const FOV_V_DEG = 2 * Math.atan((FOV_SENSOR_HEIGHT_MM / 2) / FOV_FOCAL_LENGTH_MM) * 180 / Math.PI;
+        const FOV_EARTH_RADIUS_M = 6378137.0;
+
+        function fovFrustumVectors(hFovDeg, vFovDeg) {
+            const h = Math.tan(hFovDeg / 2 * Math.PI / 180);
+            const v = Math.tan(vFovDeg / 2 * Math.PI / 180);
+            // Local camera frame: X right, Y forward, Z up.
+            return [
+                [-h, 1, v],   // top-left
+                [ h, 1, v],   // top-right
+                [ h, 1, -v],  // bottom-right
+                [-h, 1, -v]   // bottom-left
+            ];
+        }
+
+        function fovMatMul(a, b) {
+            const r = [[0,0,0],[0,0,0],[0,0,0]];
+            for (let i = 0; i < 3; i++)
+                for (let j = 0; j < 3; j++) {
+                    let sum = 0;
+                    for (let k = 0; k < 3; k++) sum += a[i][k] * b[k][j];
+                    r[i][j] = sum;
+                }
+            return r;
+        }
+
+        function fovMatVecMul(m, v) {
+            return [
+                m[0][0]*v[0] + m[0][1]*v[1] + m[0][2]*v[2],
+                m[1][0]*v[0] + m[1][1]*v[1] + m[1][2]*v[2],
+                m[2][0]*v[0] + m[2][1]*v[1] + m[2][2]*v[2]
+            ];
+        }
+
+        // Geographic Heading rotation (clockwise from North), matching the
+        // Rz / Rx / Ry composition in map_html_gen.py's get_rotation_matrix.
+        function fovRotationMatrix(yawDeg, pitchDeg, rollDeg) {
+            const yaw = yawDeg * Math.PI / 180;
+            const pitch = pitchDeg * Math.PI / 180;
+            const roll = rollDeg * Math.PI / 180;
+            const Rz = [
+                [ Math.cos(yaw), Math.sin(yaw), 0],
+                [-Math.sin(yaw), Math.cos(yaw), 0],
+                [ 0,             0,             1]
+            ];
+            const Rx = [
+                [1, 0,                0],
+                [0, Math.cos(pitch), -Math.sin(pitch)],
+                [0, Math.sin(pitch),  Math.cos(pitch)]
+            ];
+            const Ry = [
+                [ Math.cos(roll), 0, Math.sin(roll)],
+                [ 0,              1, 0],
+                [-Math.sin(roll), 0, Math.cos(roll)]
+            ];
+            return fovMatMul(fovMatMul(Rz, Rx), Ry);
+        }
+
+        function fovAddMetersToLatLon(lat, lon, dx, dy) {
+            const dLat = (dy / FOV_EARTH_RADIUS_M) * (180 / Math.PI);
+            const dLon = (dx / (FOV_EARTH_RADIUS_M * Math.cos(lat * Math.PI / 180))) * (180 / Math.PI);
+            return [lat + dLat, lon + dLon];
+        }
+
+        // pitch: gimbal pitch in degrees, 0 = level/forward, -90 = straight
+        // down (same convention as DJI OSD/GIMBAL.pitch). Defaults to
+        // straight-down when telemetry doesn't report a gimbal pitch, since
+        // that's the common camel-survey orientation.
+        function preciseFovPolygon(lat, lng, altM, yawDeg, pitchDeg, rollDeg) {
+            const alt = Math.max(1, altM || 10);
+            const pitch = (pitchDeg === null || pitchDeg === undefined || isNaN(pitchDeg)) ? -90 : pitchDeg;
+            const vectors = fovFrustumVectors(FOV_H_DEG, FOV_V_DEG);
+            const R = fovRotationMatrix(yawDeg || 0, pitch, rollDeg || 0);
+            const polygon = [];
+            for (const v of vectors) {
+                const vw = fovMatVecMul(R, v);
+                let scale;
+                if (vw[2] >= 0) {
+                    // Looking at/above the horizon — cap the footprint length.
+                    const ray2d = Math.hypot(vw[0], vw[1]) || 0.0001;
+                    scale = 2000.0 / ray2d;
+                } else {
+                    // Precise ray-ground intersection using altitude.
+                    scale = -alt / vw[2];
+                }
+                const dx = scale * vw[0];
+                const dy = scale * vw[1];
+                polygon.push(fovAddMetersToLatLon(lat, lng, dx, dy));
+            }
+            return polygon;
         }
 
         // ---------- flv.js live player with long-flight stall fix ----------
@@ -716,7 +877,9 @@ function clientCoreScript() {
         // had anything, or failed, or the socket reconnected later and missed
         // an event, drones would vanish until the next lucky telemetry packet.
         // This wraps that in: retry-on-failure, a periodic resync poll as a
-        // backup to the socket, and a resync on every socket (re)connect.
+        // backup to the socket, and a resync on every socket (re)connect. All
+        // three pages (Dashboard, Video Wall, Map Wall) share this exact same
+        // function, so they always see the same fleet at the same time.
         function setupResilientFeed(applyFn, connPillId, connLabelId) {
             const socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 5000 });
 
@@ -763,6 +926,101 @@ function clientCoreScript() {
         }
     `;
 }
+
+// ==========================================
+// 4c. SATELLITE TILE CACHE / OFFLINE TILE SERVER
+// Every map on every page (Dashboard, Video Wall inset, Map Wall) requests
+// tiles from THIS server at /tiles/:z/:x/:y.png instead of hitting a
+// satellite provider directly. That gives two things:
+//
+//   1. A place to drop your own offline tile set. Put PNG files at
+//      ./tile_cache/<z>/<x>/<y>.png using standard XYZ slippy-map
+//      numbering (the same scheme Leaflet/OSM/Google/Bing all use) and
+//      they're served straight from disk — no internet required — the
+//      next time any page loads that area.
+//   2. A caching proxy. Any tile that ISN'T already on disk is fetched
+//      once from the satellite provider below, saved to that exact
+//      z/x/y.png path, and served. The next request for the same tile —
+//      whether it's the same drone circling the same field, or a
+//      different page loading the same area — is instant and fully
+//      offline from then on.
+//
+// IMPORTANT — what this can't do: I can't bulk-download Google/Bing/Esri
+// satellite imagery for all of Saudi Arabia and ship it pre-baked here.
+// That would violate those providers' Terms of Service (their tiles are
+// licensed for on-demand map display, not redistribution/bulk mirroring),
+// and at a zoom level actually useful for spotting camels it would be
+// hundreds of gigabytes to multiple terabytes of tiles. The cache-as-you-
+// fly approach above is the realistic way to build a real offline tile
+// set for the specific areas you operate in — it grows automatically
+// every time you fly somewhere new, with an internet connection, once.
+//
+// If you already have your own legitimately-licensed imagery (survey
+// imagery, a purchased/exported MBTiles set, tiles you've personally
+// exported for offline personal use via a tool like QGIS or SAS.Planet,
+// etc.), just drop the tiles into ./tile_cache/<z>/<x>/<y>.png in this
+// same layout and the server uses them automatically — no code changes.
+// ==========================================
+const TILE_CACHE_DIR = path.join(__dirname, 'tile_cache');
+const TILE_PROVIDER_URL = (z, x, y) => `https://mt0.google.com/vt/lyrs=s&hl=en&x=${x}&y=${y}&z=${z}&s=Ga`;
+
+// 1x1 transparent PNG, served when a tile is neither cached locally nor
+// reachable online — so an unflown area shows an empty map tile instead
+// of a broken-image icon while offline.
+const BLANK_TILE_PNG = Buffer.from(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a4944415478da6360000002000155a19a0e0000000049454e44ae426082',
+    'hex'
+);
+
+// Satellite tiles are typically served as JPEG even when the on-disk cache
+// file is named "*.png" — trusting the extension for Content-Type would
+// mislabel the bytes and can make some browsers refuse to decode the
+// image. Sniff the real format from the file's magic-number header
+// instead, for both fresh fetches and cache hits.
+function sniffImageContentType(buffer) {
+    if (buffer && buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+    if (buffer && buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return 'image/png';
+    return 'image/jpeg';
+}
+
+app.get('/tiles/:z/:x/:y.png', async (req, res) => {
+    const { z, x, y } = req.params;
+    if (![z, x, y].every((v) => /^\d+$/.test(v))) return res.status(400).end();
+
+    const cachePath = path.join(TILE_CACHE_DIR, z, x, `${y}.png`);
+
+    // Already on disk (either pre-loaded by you, or cached from an earlier
+    // request) — serve it directly, works fully offline.
+    if (fs.existsSync(cachePath)) {
+        try {
+            const buffer = fs.readFileSync(cachePath);
+            res.set('Content-Type', sniffImageContentType(buffer));
+            return res.send(buffer);
+        } catch (err) {
+            // Fall through to re-fetch if the cached file is unreadable/corrupt.
+        }
+    }
+
+    // Not cached yet — fetch once from the satellite provider, save it for
+    // every future request of this exact tile, then serve it.
+    try {
+        const upstream = await fetch(TILE_PROVIDER_URL(z, x, y));
+        if (!upstream.ok) throw new Error('upstream status ' + upstream.status);
+        const buffer = Buffer.from(await upstream.arrayBuffer());
+        const contentType = sniffImageContentType(buffer);
+
+        fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+        fs.writeFile(cachePath, buffer, (err) => {
+            if (err) console.error('Failed to cache tile', cachePath, err);
+        });
+
+        res.set('Content-Type', contentType);
+        res.send(buffer);
+    } catch (err) {
+        res.set('Content-Type', 'image/png');
+        res.send(BLANK_TILE_PNG);
+    }
+});
 
 // ==========================================
 // 5. DASHBOARD — fleet picker, map, control, live video, telemetry (2x2)
@@ -873,9 +1131,9 @@ app.get('/dashboard', (req, res) => {
 
                 // ---------- Map ----------
                 const map = L.map('map', { zoomControl: true }).setView([22.3098, 39.1065], 17);
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
+                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
                 const markers = {};
-                const fovLayers = {};      // droneId -> L.polygon (camera FOV wedge)
+                const fovLayers = {};      // droneId -> L.polygon (precise camera FOV footprint)
                 const camelLayers = {};    // droneId -> L.layerGroup of red dots
 
                 function droneIcon(online, selected) {
@@ -964,8 +1222,10 @@ app.get('/dashboard', (req, res) => {
                             .on('click', () => selectDrone(id));
                     }
 
-                    // Camera FOV wedge, oriented by yaw, sized by altitude.
-                    const poly = fovPolygon(d.drone.lat, d.drone.lng, d.drone.yaw, d.drone.alt, d.fovDeg);
+                    // Precise camera-frustum FOV footprint (DJI Mini 5 Pro optics),
+                    // oriented by yaw/pitch/roll, sized by altitude — ported from
+                    // map_html_gen.py.
+                    const poly = preciseFovPolygon(d.drone.lat, d.drone.lng, d.drone.alt, d.drone.yaw, d.drone.pitch, d.drone.roll);
                     if (fovLayers[id]) {
                         fovLayers[id].setLatLngs(poly);
                     } else {
@@ -1122,28 +1382,30 @@ app.get('/control', (req, res) => {
     res.redirect('/dashboard');
 });
 
-// Old bookmark/link compatibility — video wall was merged into fleet wall.
-app.get('/video-wall', (req, res) => {
-    res.redirect('/fleet-wall');
+// Old bookmark/link compatibility — "Fleet Wall" was renamed to "Video Wall".
+app.get('/fleet-wall', (req, res) => {
+    res.redirect('/video-wall');
 });
 
 // ==========================================
-// 5b. FLEET WALL — one page, one card per drone: video + map inset + telemetry strip
-// Every connected drone gets its own tile with its own live flv.js player
-// (same stall-recovery wrapper as the dashboard) and its own small map
-// inset showing position + FOV wedge + tracked camels. Cards are laid out
-// in an explicit CSS grid (not auto-fit) sized to the current drone count,
-// so multiple simultaneous videos always render side by side instead of
-// collapsing or overlapping.
+// 5b. VIDEO WALL (formerly "Fleet Wall") — one page, one card per drone:
+// video + map inset + telemetry strip. Uses the exact same telemetry feed
+// (setupResilientFeed / '/api/drones' / 'telemetry_update') and the exact
+// same RTMP stream key (d.streamKey || droneId, same rtmp://<host>/live/<key>
+// -> http://<host>:8000/live/<key>.flv URL construction) as the Dashboard,
+// so a drone that's live on the Dashboard is live here too — no separate
+// "isLive" gate required. Every online drone gets a player attached; the
+// stream itself will simply show "no signal" placeholder text if nothing is
+// actually publishing to that key yet.
 // ==========================================
-app.get('/fleet-wall', (req, res) => {
+app.get('/video-wall', (req, res) => {
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>FFly Fleet Wall</title>
+            <title>FFly Video Wall</title>
             <script src="/socket.io/socket.io.js"></script>
             <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
             <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
@@ -1151,7 +1413,7 @@ app.get('/fleet-wall', (req, res) => {
             <style>${sharedStyles()}</style>
         </head>
         <body>
-            ${topBar(0, 'fleet-wall')}
+            ${topBar(0, 'video-wall')}
             <div class="fw-wrap">
                 <div class="fw-toolbar">
                     <span class="count mono" id="fwCount">0 connections</span>
@@ -1167,7 +1429,7 @@ app.get('/fleet-wall', (req, res) => {
                 const dronesById = {};   // droneId -> latest telemetry record
                 const players = {};      // droneId -> live player wrapper from createLivePlayer
                 const maps = {};         // droneId -> { map, marker, fov, camelLayer }
-                const renderState = {};  // droneId -> {online, live, hasFix} as of the last DOM rebuild
+                const renderState = {};  // droneId -> {online} as of the last time we acted on it
                 const cardEls = {};      // droneId -> cached element references for this card (see cacheCardEls)
                 const OFFLINE_AFTER_MS = 15000;
 
@@ -1201,13 +1463,11 @@ app.get('/fleet-wall', (req, res) => {
                 }
 
                 function computeState(d) {
-                    const online = isOnline(d);
-                    const hasFix = !!d.drone?.hasGPSFix && typeof d.drone?.lat === 'number';
-                    return { online, live: !!d.isLive && online, hasFix };
+                    return { online: isOnline(d) };
                 }
 
                 function statesEqual(a, b) {
-                    return !!a && !!b && a.online === b.online && a.live === b.live && a.hasFix === b.hasFix;
+                    return !!a && !!b && a.online === b.online;
                 }
 
                 // ---------- video (shared flv.js wrapper with the stall fix) ----------
@@ -1215,7 +1475,7 @@ app.get('/fleet-wall', (req, res) => {
                     try {
                         if (players[id]) players[id].destroy();
                     } catch (e) {
-                        console.error('[fleet-wall] error destroying player for', id, e);
+                        console.error('[video-wall] error destroying player for', id, e);
                     } finally {
                         delete players[id];
                     }
@@ -1235,12 +1495,12 @@ app.get('/fleet-wall', (req, res) => {
                             else if (status === 'tap to play') { statusEl.innerText = 'tap to play'; statusEl.className = 'fw-status offline'; }
                         });
                     } catch (e) {
-                        console.error('[fleet-wall] failed to start player for', id, streamKey, e);
+                        console.error('[video-wall] failed to start player for', id, streamKey, e);
                         if (statusEl) { statusEl.innerText = 'error'; statusEl.className = 'fw-status offline'; }
                     }
                 }
 
-                // ---------- per-card map inset (FOV wedge + red camel dots) ----------
+                // ---------- per-card map inset (precise FOV footprint + red camel dots) ----------
                 function droneIcon(online) {
                     return L.divIcon({
                         className: '',
@@ -1264,9 +1524,11 @@ app.get('/fleet-wall', (req, res) => {
                     try {
                         const lat = d.drone?.lat;
                         const lng = d.drone?.lng;
-                        if (typeof lat !== 'number' || typeof lng !== 'number') return;
+                        const hasFix = !!d.drone?.hasGPSFix && typeof lat === 'number' && typeof lng === 'number';
+                        if (mapEl) mapEl.style.display = hasFix ? 'block' : 'none';
+                        if (!hasFix) return;
 
-                        const fovPts = fovPolygon(lat, lng, d.drone?.yaw, d.drone?.alt, d.fovDeg);
+                        const fovPts = preciseFovPolygon(lat, lng, d.drone?.alt, d.drone?.yaw, d.drone?.pitch, d.drone?.roll);
                         const camels = Array.isArray(d.camels) ? d.camels : [];
 
                         if (!maps[id]) {
@@ -1277,7 +1539,7 @@ app.get('/fleet-wall', (req, res) => {
                                 doubleClickZoom: false,
                                 attributionControl: false
                             }).setView([lat, lng], 17);
-                            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 22 }).addTo(map);
+                            L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
                             const marker = L.marker([lat, lng], { icon: droneIcon(isOnline(d)) }).addTo(map);
                             const fov = L.polygon(fovPts, {
                                 color: '#5fd4d0', weight: 1, fillColor: '#5fd4d0', fillOpacity: 0.18, interactive: false
@@ -1290,26 +1552,42 @@ app.get('/fleet-wall', (req, res) => {
                                     }).addTo(camelLayer);
                                 }
                             });
-                            maps[id] = { map, marker, fov, camelLayer };
+                            maps[id] = { map, marker, fov, camelLayer, lastRecenter: Date.now() };
                             // Tiles can render gray until the container has real layout dimensions.
                             requestAnimationFrame(() => { try { map.invalidateSize(); } catch (e) {} });
                             setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 250);
                         } else {
-                            maps[id].map.setView([lat, lng], maps[id].map.getZoom());
-                            maps[id].marker.setLatLng([lat, lng]);
-                            maps[id].marker.setIcon(droneIcon(isOnline(d)));
-                            maps[id].fov.setLatLngs(fovPts);
-                            maps[id].camelLayer.clearLayers();
+                            const m = maps[id];
+                            m.marker.setLatLng([lat, lng]);
+                            m.marker.setIcon(droneIcon(isOnline(d)));
+                            m.fov.setLatLngs(fovPts);
+                            m.camelLayer.clearLayers();
                             camels.forEach((c) => {
                                 if (typeof c.lat === 'number' && typeof c.lng === 'number') {
                                     L.circleMarker([c.lat, c.lng], {
                                         radius: 4, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.85, interactive: false
-                                    }).addTo(maps[id].camelLayer);
+                                    }).addTo(m.camelLayer);
                                 }
                             });
+
+                            // Recentering on every packet was the bug: it cancels
+                            // any in-flight tile request and starts a new one
+                            // before the old one finishes, so tiles never render
+                            // while telemetry keeps flowing — only once it stops.
+                            // Now we only recenter when the drone has actually
+                            // drifted near the edge of the inset, and never more
+                            // than once every 4 seconds, so tile loads can
+                            // actually complete.
+                            const now = Date.now();
+                            const bounds = m.map.getBounds();
+                            const nearEdge = !bounds.pad(-0.2).contains([lat, lng]);
+                            if (nearEdge && (now - m.lastRecenter) > 4000) {
+                                m.map.setView([lat, lng], m.map.getZoom(), { animate: false });
+                                m.lastRecenter = now;
+                            }
                         }
                     } catch (e) {
-                        console.error('[fleet-wall] error rendering map for', id, e);
+                        console.error('[video-wall] error rendering map for', id, e);
                     }
                 }
 
@@ -1336,18 +1614,24 @@ app.get('/fleet-wall', (req, res) => {
                 function cardHTML(id, d) {
                     const sid = safeId(id);
                     const online = isOnline(d);
-                    const live = !!d.isLive && online;
+                    const live = online;
                     const hasFix = !!d.drone?.hasGPSFix && typeof d.drone?.lat === 'number';
                     const displayName = String(d.name || id).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+                    // The .fw-map container is ALWAYS present in the markup —
+                    // only its visibility toggles with hasFix. This means a
+                    // GPS-fix flicker never needs to add/remove DOM nodes, so
+                    // it's handled entirely by updateCardInPlace() and never
+                    // forces a full grid rebuild (which would otherwise tear
+                    // down a perfectly good, already-playing video).
                     return '<div class="fw-card" data-id="' + sid + '">' +
                         '<div class="fw-card-header">' +
                             '<div class="fw-label"><span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span><span class="fw-name">' + displayName + '</span></div>' +
-                            '<span class="fw-status ' + (live ? 'live' : 'offline') + '" id="fwstatus-' + sid + '">' + (live ? 'connecting' : (online ? 'no stream' : 'offline')) + '</span>' +
+                            '<span class="fw-status ' + (live ? 'live' : 'offline') + '" id="fwstatus-' + sid + '">' + (live ? 'connecting' : 'offline') + '</span>' +
                         '</div>' +
                         '<div class="fw-video-box">' +
                             '<video id="fwvideo-' + sid + '" muted playsinline autoplay style="display:' + (live ? 'block' : 'none') + ';"></video>' +
-                            '<div class="fw-placeholder" id="fwplaceholder-' + sid + '" style="display:' + (live ? 'none' : 'block') + ';">' + (online ? 'Connected — not streaming' : 'No signal') + '</div>' +
-                            (hasFix ? '<div class="fw-map" id="fwmap-' + sid + '"></div>' : '') +
+                            '<div class="fw-placeholder" id="fwplaceholder-' + sid + '" style="display:' + (live ? 'none' : 'block') + ';">' + (online ? 'Connecting…' : 'No signal') + '</div>' +
+                            '<div class="fw-map" id="fwmap-' + sid + '" style="display:' + (hasFix ? 'block' : 'none') + ';"></div>' +
                         '</div>' +
                         '<div class="fw-telemetry" id="fwtelemetry-' + sid + '">' + telemetryFieldsHTML(d) + '</div>' +
                     '</div>';
@@ -1406,21 +1690,27 @@ app.get('/fleet-wall', (req, res) => {
                     grid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
                     grid.style.gridTemplateRows = 'repeat(' + rows + ', minmax(220px, 1fr))';
 
+                    // grid.innerHTML below destroys and recreates every card's
+                    // DOM, including every <video> and map-inset container —
+                    // even for drones whose card content didn't otherwise
+                    // change. Any player/map object still referencing one of
+                    // those now-detached elements would keep "succeeding"
+                    // internally while never appearing on screen again, which
+                    // is exactly the "connects, then stuck on connecting"
+                    // symptom. So: tear every player and map down FIRST, then
+                    // rebuild markup, then start fresh ones attached to the
+                    // new elements.
+                    Object.keys(players).forEach(destroyPlayer);
+                    Object.keys(maps).forEach(destroyMap);
+
                     grid.innerHTML = ids.map((id) => {
                         try {
                             return cardHTML(id, dronesById[id]);
                         } catch (e) {
-                            console.error('[fleet-wall] failed to build card for', id, e);
+                            console.error('[video-wall] failed to build card for', id, e);
                             return '';
                         }
                     }).join('');
-
-                    Object.keys(players).forEach((id) => {
-                        if (!dronesById[id] || !dronesById[id].isLive || !isOnline(dronesById[id])) destroyPlayer(id);
-                    });
-                    Object.keys(maps).forEach((id) => {
-                        if (!dronesById[id]) destroyMap(id);
-                    });
 
                     ids.forEach((id) => {
                         try {
@@ -1429,7 +1719,8 @@ app.get('/fleet-wall', (req, res) => {
                             const els = cardEls[id];
                             if (!els || !els.root) return; // this card's HTML failed to build; skip it, don't touch others
 
-                            if (d.isLive && isOnline(d) && !players[id] && els.video) {
+                            // Same RTMP/HTTP-FLV stream key the Dashboard uses.
+                            if (isOnline(d) && !players[id] && els.video) {
                                 startPlayer(id, d.streamKey || id, els.video, els.status);
                             }
 
@@ -1437,7 +1728,7 @@ app.get('/fleet-wall', (req, res) => {
 
                             renderState[id] = computeState(d);
                         } catch (e) {
-                            console.error('[fleet-wall] error setting up card for', id, e);
+                            console.error('[video-wall] error setting up card for', id, e);
                         }
                     });
 
@@ -1450,7 +1741,7 @@ app.get('/fleet-wall', (req, res) => {
                 function updateCounts() {
                     const ids = Object.keys(dronesById);
                     document.getElementById('fwCount').innerText = ids.length + ' connection' + (ids.length === 1 ? '' : 's');
-                    const liveCount = ids.filter((id) => dronesById[id].isLive && isOnline(dronesById[id])).length;
+                    const liveCount = ids.filter((id) => isOnline(dronesById[id])).length;
                     document.getElementById('fwLiveCount').innerText = liveCount + ' live';
                     const countEl = document.getElementById('fleetCount');
                     if (countEl) countEl.innerText = ids.length;
@@ -1479,7 +1770,7 @@ app.get('/fleet-wall', (req, res) => {
 
                         if (els.map) ensureMap(id, d, els.map);
                     } catch (e) {
-                        console.error('[fleet-wall] error updating card in place for', id, e);
+                        console.error('[video-wall] error updating card in place for', id, e);
                     }
                 }
 
@@ -1507,7 +1798,7 @@ app.get('/fleet-wall', (req, res) => {
                     try {
                         refresh(id);
                     } catch (e) {
-                        console.error('[fleet-wall] error applying update for', id, e);
+                        console.error('[video-wall] error applying update for', id, e);
                     }
                 }
 
@@ -1519,7 +1810,7 @@ app.get('/fleet-wall', (req, res) => {
                 // won't touch a live video unless a status actually flipped.
                 setInterval(() => {
                     Object.keys(dronesById).forEach((id) => {
-                        try { refresh(id); } catch (e) { console.error('[fleet-wall] error in periodic refresh for', id, e); }
+                        try { refresh(id); } catch (e) { console.error('[video-wall] error in periodic refresh for', id, e); }
                     });
                 }, 5000);
 
@@ -1535,15 +1826,203 @@ app.get('/fleet-wall', (req, res) => {
 });
 
 // ==========================================
+// 5c. MAP WALL — a single satellite map showing every connected drone at
+// once, each with its precise camera-frustum FOV footprint and every camel
+// it's currently tracking. Uses the exact same telemetry feed as the
+// Dashboard and Video Wall (setupResilientFeed / '/api/drones' /
+// 'telemetry_update'), and the same preciseFovPolygon() ported from
+// map_html_gen.py, so all three pages always agree on where the FOV
+// footprint is drawn.
+// ==========================================
+app.get('/map-wall', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>FFly Map Wall</title>
+            <script src="/socket.io/socket.io.js"></script>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+            <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+            <style>${sharedStyles()}</style>
+        </head>
+        <body>
+            ${topBar(0, 'map-wall')}
+            <div class="mw-layout">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h3>Fleet Satellite Map</h3>
+                        <span class="mono" style="font-size:11px;color:var(--text-faint);" id="mwCount">0 drones &middot; 0 camels tracked</span>
+                    </div>
+                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                        <div id="mwMap"></div>
+                        <div class="map-legend">
+                            <div class="row"><span class="swatch fov"></span>camera FOV</div>
+                            <div class="row"><span class="swatch camel"></span>camel tracked</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <script>
+                ${clientCoreScript()}
+
+                const dronesById = {};
+                const markers = {};
+                const fovLayers = {};
+                const camelLayers = {};
+                let didInitialFit = false;
+
+                const map = L.map('mwMap', { zoomControl: true }).setView([22.3098, 39.1065], 17);
+
+                // Google satellite tiles — same source used in map_html_gen.py's
+                // generated per-flight dashboard, so the aerial imagery style
+                // matches what's already familiar from those single-flight reviews.
+                L.tileLayer('/tiles/{z}/{x}/{y}.png', {
+                    maxZoom: 22,
+                    attribution: 'Satellite imagery via local tile cache'
+                }).addTo(map);
+
+                function fmtNum(n, digits) {
+                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
+                }
+
+                function isOnline(d) {
+                    return (Date.now() - (d.lastUpdate || 0)) < 15000;
+                }
+
+                function droneIcon(online, armed) {
+                    const color = online ? (armed ? '#e8a33d' : '#57c77a') : '#57657a';
+                    return L.divIcon({
+                        className: '',
+                        html: '<div style="width:16px;height:16px;border-radius:50%;background:' + color + ';border:2px solid #0d1117;box-shadow:0 0 0 2px rgba(255,255,255,0.15);"></div>',
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                    });
+                }
+
+                function popupHTML(id, d) {
+                    const online = isOnline(d);
+                    const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
+                    return '<div class="mw-popup">' +
+                        '<b>' + (d.name || id) + '</b><br/>' +
+                        'status: ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '<br/>' +
+                        'alt: ' + fmtNum(d.drone?.alt, 1) + ' m<br/>' +
+                        'yaw: ' + fmtNum(d.drone?.yaw, 0) + '°<br/>' +
+                        'gimbal: ' + fmtNum(d.drone?.pitch, 0) + '°<br/>' +
+                        'gps: ' + (d.drone?.hasGPSFix ? 'LOCKED' : 'NO FIX') + '<br/>' +
+                        'camels tracked: ' + camelCount +
+                    '</div>';
+                }
+
+                function upsertDrone(id, d) {
+                    const lat = d.drone?.lat;
+                    const lng = d.drone?.lng;
+                    if (typeof lat !== 'number' || typeof lng !== 'number') return;
+
+                    const online = isOnline(d);
+
+                    if (markers[id]) {
+                        markers[id].setLatLng([lat, lng]);
+                        markers[id].setIcon(droneIcon(online, d.armed));
+                        markers[id].setPopupContent(popupHTML(id, d));
+                    } else {
+                        markers[id] = L.marker([lat, lng], { icon: droneIcon(online, d.armed) })
+                            .addTo(map)
+                            .bindPopup(popupHTML(id, d));
+                    }
+
+                    // Precise camera-frustum FOV footprint (ported from
+                    // map_html_gen.py), oriented by yaw/pitch/roll, sized by
+                    // altitude.
+                    const poly = preciseFovPolygon(lat, lng, d.drone?.alt, d.drone?.yaw, d.drone?.pitch, d.drone?.roll);
+                    if (fovLayers[id]) {
+                        fovLayers[id].setLatLngs(poly);
+                    } else {
+                        fovLayers[id] = L.polygon(poly, {
+                            color: '#5fd4d0', weight: 1.5, fillColor: '#5fd4d0', fillOpacity: 0.22, interactive: false
+                        }).addTo(map);
+                    }
+
+                    // Red dots for every camel currently tracked by this drone.
+                    const camels = Array.isArray(d.camels) ? d.camels : [];
+                    if (!camelLayers[id]) camelLayers[id] = L.layerGroup().addTo(map);
+                    camelLayers[id].clearLayers();
+                    camels.forEach((c) => {
+                        if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                            L.circleMarker([c.lat, c.lng], {
+                                radius: 5, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.9, interactive: false
+                            }).addTo(camelLayers[id]);
+                        }
+                    });
+                }
+
+                function removeStale() {
+                    const now = Date.now();
+                    Object.keys(dronesById).forEach((id) => {
+                        const d = dronesById[id];
+                        if (markers[id]) markers[id].setIcon(droneIcon(isOnline(d), d.armed));
+                    });
+                }
+
+                function updateSummary() {
+                    const ids = Object.keys(dronesById);
+                    const camelTotal = ids.reduce((sum, id) => {
+                        const d = dronesById[id];
+                        return sum + (Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0));
+                    }, 0);
+                    document.getElementById('mwCount').innerText = ids.length + ' drones \u00b7 ' + camelTotal + ' camels tracked';
+                    const countEl = document.getElementById('fleetCount');
+                    if (countEl) countEl.innerText = ids.length;
+                }
+
+                function applyUpdate(data) {
+                    const id = data.droneId || 'drone-1';
+                    const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
+                    dronesById[id] = data;
+                    try {
+                        upsertDrone(id, data);
+                    } catch (e) {
+                        console.error('[map-wall] error updating drone', id, e);
+                    }
+                    updateSummary();
+
+                    // Center the map on the very first GPS fix we ever see, so
+                    // the page doesn't sit on the default fallback coordinates
+                    // once real telemetry starts arriving.
+                    if (isFirstFixForFleet) {
+                        didInitialFit = true;
+                        map.setView([data.drone.lat, data.drone.lng], 17);
+                    }
+                }
+
+                setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
+
+                // Periodic sweep so a drone's marker dims to "offline" purely
+                // from the passage of time, without needing a new packet.
+                setInterval(removeStale, 5000);
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// ==========================================
 // 6. SERVER INITIALIZATION
 // ==========================================
 const PORT = process.env.PORT || 3000;
+fs.mkdirSync(TILE_CACHE_DIR, { recursive: true });
 server.listen(PORT, () => {
     console.log(`============================================`);
     console.log(`FFly Ground Control Server active on port ${PORT}`);
     console.log(`- RTMP ingest: rtmp://localhost:1935/live/<droneId>`);
     console.log(`- HTTP-FLV stream: http://localhost:8000/live/<droneId>.flv`);
     console.log(`- Dashboard (map + control + live + telemetry): http://localhost:3000/dashboard`);
-    console.log(`- Fleet wall (per-drone card: video + map + telemetry): http://localhost:3000/fleet-wall`);
+    console.log(`- Video Wall (per-drone card: video + map + telemetry): http://localhost:3000/video-wall`);
+    console.log(`- Map Wall (satellite map: all drones + FOV + camels): http://localhost:3000/map-wall`);
+    console.log(`- Satellite tile cache: ${TILE_CACHE_DIR}`);
+    console.log(`  Drop your own tiles as <z>/<x>/<y>.png to fly fully offline over that area.`);
+    console.log(`  Requires Node 18+ for the built-in fetch() used to cache new tiles.`);
     console.log(`============================================`);
 });
