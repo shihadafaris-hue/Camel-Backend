@@ -234,6 +234,16 @@ app.post('/api/control/:droneId', (req, res) => {
     res.status(200).json(payload);
 });
 
+app.delete('/api/drones/:droneId', (req, res) => {
+    const { droneId } = req.params;
+    if (drones[droneId]) {
+        delete drones[droneId];
+        io.emit('drone_removed', { droneId });
+        return res.status(200).json({ message: 'removed', droneId });
+    }
+    res.status(404).json({ message: 'drone not found', droneId });
+});
+
 app.get('/api/control/:droneId/latest', (req, res) => {
     const state = getOrCreateControlState(req.params.droneId);
     res.status(200).json({ droneId: req.params.droneId, ...state });
@@ -246,21 +256,36 @@ function sharedStyles() {
     return `
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
-        :root {
-            --bg: #0d1117;
-            --panel: #141a24;
-            --panel-raised: #1b2330;
-            --border: #262f3d;
-            --text: #dde3ed;
-            --text-dim: #8592a6;
-            --text-faint: #57657a;
-            --cyan: #5fd4d0;
-            --amber: #e8a33d;
-            --red: #e5484d;
-            --green: #57c77a;
-            --radius: 10px;
-            --topbar-h: 66px;
-        }
+       :root {
+                   --bg: #f5f7fa;
+                   --panel: #ffffff;
+                   --panel-raised: #eef1f6;
+                   --border: #d8dee8;
+                   --text: #1b2330;
+                   --text-dim: #566072;
+                   --text-faint: #8592a6;
+                   --cyan: #1f9d98;
+                   --amber: #b9700a;
+                   --red: #c93337;
+                   --green: #2f9e56;
+                   --radius: 10px;
+                   --topbar-h: 66px;
+               }
+
+               [data-theme="dark"] {
+                   --bg: #0d1117;
+                   --panel: #141a24;
+                   --panel-raised: #1b2330;
+                   --border: #262f3d;
+                   --text: #dde3ed;
+                   --text-dim: #8592a6;
+                   --text-faint: #57657a;
+                   --cyan: #5fd4d0;
+                   --amber: #e8a33d;
+                   --red: #e5484d;
+                   --green: #57c77a;
+               }
+               }
 
         * { box-sizing: border-box; }
 
@@ -414,6 +439,11 @@ function sharedStyles() {
         .drone-card .name { font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 600; }
         .drone-card .meta { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-faint); margin-top: 2px; }
         .drone-card .status { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); }
+                .drone-delete-btn {
+                    flex: 0 0 auto; border: 1px solid var(--border); background: transparent; color: var(--text-faint);
+                    border-radius: 6px; width: 22px; height: 22px; font-size: 12px; line-height: 1; padding: 0;
+                }
+                .drone-delete-btn:hover { border-color: var(--red); color: var(--red); }
 
         /* strict 2x2, each cell fills its share of the viewport height */
         .quad {
@@ -511,9 +541,20 @@ function sharedStyles() {
             display: flex; align-items: center; justify-content: space-between;
             flex: 0 0 auto;
         }
-        .fw-toolbar .count {
-            font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-dim);
-        }
+      .fw-toolbar .count {
+                  font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-dim);
+              }
+              .fw-toggles {
+                  flex: 0 0 auto;
+                  display: flex; flex-wrap: wrap; gap: 8px;
+              }
+              .fw-toggle-pill {
+                  display: flex; align-items: center; gap: 6px;
+                  border: 1px solid var(--border); border-radius: 20px;
+                  padding: 5px 12px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
+                  color: var(--text-dim); cursor: pointer; user-select: none;
+              }
+              .fw-toggle-pill input { accent-color: var(--cyan); cursor: pointer; }
         .fw-grid {
             flex: 1 1 auto;
             min-height: 0;
@@ -620,8 +661,9 @@ function topBar(fleetCount, activeNav) {
                 ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
                 ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
                 ${navLink('/map-wall', 'MAP WALL', 'map-wall')}
-                <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
-                <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
+               <button class="nav-link" id="themeToggle" type="button">☀ LIGHT</button>
+                               <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
+                               <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
             </div>
         </div>
     `;
@@ -640,6 +682,23 @@ function topBar(fleetCount, activeNav) {
 // ==========================================
 function clientCoreScript() {
     return `
+        // ---------- theme toggle (light default, persisted) ----------
+        function initThemeToggle(buttonId) {
+            const btn = document.getElementById(buttonId);
+            function label() {
+                const t = document.documentElement.getAttribute('data-theme') || 'light';
+                return t === 'dark' ? '☾ DARK' : '☀ LIGHT';
+            }
+            if (btn) btn.innerText = label();
+            if (btn) btn.addEventListener('click', () => {
+                const current = document.documentElement.getAttribute('data-theme') || 'light';
+                const next = current === 'dark' ? 'light' : 'dark';
+                document.documentElement.setAttribute('data-theme', next);
+                try { localStorage.setItem('ffly_theme', next); } catch (e) {}
+                btn.innerText = label();
+            });
+        }
+
         // ---------- geo math ----------
         // Great-circle destination point given a start point, bearing, and
         // distance — used as a fallback when we only have a bare fovDeg (no
@@ -1032,8 +1091,9 @@ app.get('/dashboard', (req, res) => {
         <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>FFly Command Center</title>
-            <script src="/socket.io/socket.io.js"></script>
+          <title>FFly Command Center</title>
+                      <script>(function(){try{document.documentElement.setAttribute('data-theme', localStorage.getItem('ffly_theme') || 'light');}catch(e){}})();</script>
+                      <script src="/socket.io/socket.io.js"></script>
             <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
             <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
             <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
@@ -1121,11 +1181,12 @@ app.get('/dashboard', (req, res) => {
                 </div>
             </div>
 
-            <script>
-                ${clientCoreScript()}
+    <script>
+                    ${clientCoreScript()}
+                    initThemeToggle('themeToggle');
 
-                const dronesById = {};
-                let selectedDroneId = null;
+                    const dronesById = {};
+                    let selectedDroneId = null;
                 let livePlayer = null;
                 try { selectedDroneId = localStorage.getItem('ffly_selected_drone') || null; } catch (e) {}
 
@@ -1163,18 +1224,49 @@ app.get('/dashboard', (req, res) => {
                         const online = (Date.now() - (d.lastUpdate || 0)) < 15000;
                         const sel = id === selectedDroneId ? 'selected' : '';
                         const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
-                        return '<div class="drone-card ' + sel + '" data-id="' + id + '">' +
-                            '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
-                            '<div class="info"><div class="name">' + (d.name || id) + '</div>' +
-                            '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + camelCount + ' tracked</div></div>' +
-                            '<div class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</div>' +
-                        '</div>';
-                    }).join('');
+               return '<div class="drone-card ' + sel + '" data-id="' + id + '">' +
+                                           '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
+                                           '<div class="info"><div class="name">' + (d.name || id) + '</div>' +
+                                           '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + camelCount + ' tracked</div></div>' +
+                                           '<div class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</div>' +
+                                           (online ? '' : '<button class="drone-delete-btn" data-id="' + id + '" title="Remove offline drone">✕</button>') +
+                                       '</div>';
+                                   }).join('');
 
-                    list.querySelectorAll('.drone-card').forEach((el) => {
-                        el.addEventListener('click', () => selectDrone(el.getAttribute('data-id')));
-                    });
-                }
+                                   list.querySelectorAll('.drone-card').forEach((el) => {
+                                       el.addEventListener('click', () => selectDrone(el.getAttribute('data-id')));
+                                   });
+                                   list.querySelectorAll('.drone-delete-btn').forEach((btn) => {
+                                       btn.addEventListener('click', (e) => {
+                                           e.stopPropagation();
+                                           deleteDrone(btn.getAttribute('data-id'));
+                                       });
+                                   });
+                               }
+
+                               function deleteDrone(id) {
+                                   fetch('/api/drones/' + encodeURIComponent(id), { method: 'DELETE' })
+                                       .then(() => {
+                                           delete dronesById[id];
+                                           if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
+                                           if (fovLayers[id]) { map.removeLayer(fovLayers[id]); delete fovLayers[id]; }
+                                           if (camelLayers[id]) { map.removeLayer(camelLayers[id]); delete camelLayers[id]; }
+                                           if (selectedDroneId === id) {
+                                               selectedDroneId = null;
+                                               try { localStorage.removeItem('ffly_selected_drone'); } catch (e) {}
+                                               setControlsEnabled(false);
+                                               document.getElementById('selectedLabel').innerText = 'no drone selected';
+                                               document.getElementById('targetDroneLabel').innerText = 'no target';
+                                               if (livePlayer) { livePlayer.destroy(); livePlayer = null; }
+                                               document.getElementById('videoPlaceholder').style.display = 'block';
+                                               updateTelemetryPanel();
+                                           }
+                                           renderFleetList();
+                                           const countEl = document.getElementById('fleetCount');
+                                           if (countEl) countEl.innerText = Object.keys(dronesById).length;
+                                       })
+                                       .catch((err) => console.error('Failed to delete drone', id, err));
+                               }
 
                 function selectDrone(id) {
                     selectedDroneId = id;
@@ -1405,8 +1497,9 @@ app.get('/video-wall', (req, res) => {
         <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>FFly Video Wall</title>
-            <script src="/socket.io/socket.io.js"></script>
+        <title>FFly Video Wall</title>
+                    <script>(function(){try{document.documentElement.setAttribute('data-theme', localStorage.getItem('ffly_theme') || 'light');}catch(e){}})();</script>
+                    <script src="/socket.io/socket.io.js"></script>
             <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
             <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
             <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
@@ -1416,10 +1509,11 @@ app.get('/video-wall', (req, res) => {
             ${topBar(0, 'video-wall')}
             <div class="fw-wrap">
                 <div class="fw-toolbar">
-                    <span class="count mono" id="fwCount">0 connections</span>
-                    <span class="count mono" id="fwLiveCount">0 live</span>
-                </div>
-                <div class="fw-grid" id="fwGrid"></div>
+                                    <span class="count mono" id="fwCount">0 connections</span>
+                                    <span class="count mono" id="fwLiveCount">0 live</span>
+                                </div>
+                                <div class="fw-toggles" id="fwToggles"></div>
+                                <div class="fw-grid" id="fwGrid"></div>
                 <div class="fw-empty" id="fwEmpty">Waiting for drones to connect…</div>
             </div>
 
@@ -1427,7 +1521,8 @@ app.get('/video-wall', (req, res) => {
                 ${clientCoreScript()}
 
                 const dronesById = {};   // droneId -> latest telemetry record
-                const players = {};      // droneId -> live player wrapper from createLivePlayer
+                                const visibleDrones = {}; // droneId -> true/false, whether its card should render (default: true)
+                                const players = {};      // droneId -> live player wrapper from createLivePlayer
                 const maps = {};         // droneId -> { map, marker, fov, camelLayer }
                 const renderState = {};  // droneId -> {online} as of the last time we acted on it
                 const cardEls = {};      // droneId -> cached element references for this card (see cacheCardEls)
@@ -1667,9 +1762,29 @@ app.get('/video-wall', (req, res) => {
                 // drone (bad stream key, malformed telemetry, whatever) is
                 // logged and skipped instead of throwing out of the forEach and
                 // silently aborting setup for every drone processed after it.
-                function renderGrid() {
-                    const ids = Object.keys(dronesById);
-                    const grid = document.getElementById('fwGrid');
+               function renderDroneToggles() {
+                                   const container = document.getElementById('fwToggles');
+                                   if (!container) return;
+                                   const allIds = Object.keys(dronesById);
+                                   container.innerHTML = allIds.map((id) => {
+                                       const d = dronesById[id];
+                                       const checked = visibleDrones[id] !== false;
+                                       return '<label class="fw-toggle-pill"><input type="checkbox" data-drone-id="' + safeId(id) + '" ' + (checked ? 'checked' : '') + ' /> ' + (d.name || id) + '</label>';
+                                   }).join('');
+                                   container.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                                       cb.addEventListener('change', (e) => {
+                                           const sid = e.target.getAttribute('data-drone-id');
+                                           const id = allIds.find((x) => safeId(x) === sid);
+                                           if (!id) return;
+                                           visibleDrones[id] = e.target.checked;
+                                           renderGrid();
+                                       });
+                                   });
+                               }
+
+                               function renderGrid() {
+                                   const ids = Object.keys(dronesById).filter((id) => visibleDrones[id] !== false);
+                                   const grid = document.getElementById('fwGrid');
                     const empty = document.getElementById('fwEmpty');
 
                     if (ids.length === 0) {
@@ -1779,10 +1894,16 @@ app.get('/video-wall', (req, res) => {
                 // just a lightweight in-place refresh — this is what stops the
                 // video from being torn down and reconnected on every telemetry
                 // packet.
-                function refresh(id) {
-                    const d = dronesById[id];
-                    if (!d) return;
-                    const newState = computeState(d);
+               function refresh(id) {
+                                   const d = dronesById[id];
+                                   if (!d) return;
+                                   if (visibleDrones[id] === false) {
+                                       // Hidden by the user's checkbox — drop any stale render
+                                       // state so re-enabling it later rebuilds cleanly.
+                                       if (id in renderState) delete renderState[id];
+                                       return;
+                                   }
+                                   const newState = computeState(d);
                     const isNew = !(id in renderState);
                     if (isNew || !statesEqual(renderState[id], newState)) {
                         renderGrid();
@@ -1792,15 +1913,20 @@ app.get('/video-wall', (req, res) => {
                     }
                 }
 
-                function applyUpdate(data) {
-                    const id = data.droneId || 'drone-1';
-                    dronesById[id] = data;
-                    try {
-                        refresh(id);
-                    } catch (e) {
-                        console.error('[video-wall] error applying update for', id, e);
-                    }
-                }
+             function applyUpdate(data) {
+                                 const id = data.droneId || 'drone-1';
+                                 const isNewDrone = !(id in dronesById);
+                                 dronesById[id] = data;
+                                 if (isNewDrone) {
+                                     visibleDrones[id] = true; // display all drones by default, including new ones as they join
+                                     renderDroneToggles();
+                                 }
+                                 try {
+                                     refresh(id);
+                                 } catch (e) {
+                                     console.error('[video-wall] error applying update for', id, e);
+                                 }
+                             }
 
                 setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
 
@@ -1841,8 +1967,9 @@ app.get('/map-wall', (req, res) => {
         <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>FFly Map Wall</title>
-            <script src="/socket.io/socket.io.js"></script>
+           <title>FFly Map Wall</title>
+                       <script>(function(){try{document.documentElement.setAttribute('data-theme', localStorage.getItem('ffly_theme') || 'light');}catch(e){}})();</script>
+                       <script src="/socket.io/socket.io.js"></script>
             <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
             <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
             <style>${sharedStyles()}</style>
@@ -1977,25 +2104,25 @@ app.get('/map-wall', (req, res) => {
                     if (countEl) countEl.innerText = ids.length;
                 }
 
-                function applyUpdate(data) {
-                    const id = data.droneId || 'drone-1';
-                    const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
-                    dronesById[id] = data;
-                    try {
-                        upsertDrone(id, data);
-                    } catch (e) {
-                        console.error('[map-wall] error updating drone', id, e);
-                    }
-                    updateSummary();
+       function applyUpdate(data) {
+                           const id = data.droneId || 'drone-1';
+                           const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
+                           dronesById[id] = data;
+                           try {
+                               upsertDrone(id, data);
+                           } catch (e) {
+                               console.error('[map-wall] error updating drone', id, e);
+                           }
+                           updateSummary();
 
-                    // Center the map on the very first GPS fix we ever see, so
-                    // the page doesn't sit on the default fallback coordinates
-                    // once real telemetry starts arriving.
-                    if (isFirstFixForFleet) {
-                        didInitialFit = true;
-                        map.setView([data.drone.lat, data.drone.lng], 17);
-                    }
-                }
+                           // Center the map on the very first GPS fix we ever see, so
+                           // the page doesn't sit on the default fallback coordinates
+                           // once real telemetry starts arriving.
+                           if (isFirstFixForFleet) {
+                               didInitialFit = true;
+                               map.setView([data.drone.lat, data.drone.lng], 17);
+                           }
+                       }
 
                 setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
 
