@@ -49,6 +49,15 @@ const drones = {};
 // droneId -> latest control command queued for that drone to pick up
 const controlState = {};
 
+// ==========================================
+// SWARM LEADER SELECTION
+// The website nominates a leader; it never forces any aircraft into
+// autonomous flight by itself — each aircraft's own app has to enable
+// "follow" locally. This just tells followers WHO to look at in the
+// telemetry_update stream they already receive.
+// ==========================================
+let swarmLeaderId = null; // null = no leader designated / manual flight for everyone
+
 function getOrCreateControlState(droneId) {
     if (!controlState[droneId]) {
         controlState[droneId] = { commandId: 0, command: null, params: null, updatedAt: null };
@@ -232,6 +241,37 @@ app.post('/api/control/:droneId', (req, res) => {
     }
 
     res.status(200).json(payload);
+});
+
+app.post('/api/leader', (req, res) => {
+    const { droneId } = req.body || {};
+    if (droneId && !drones[droneId]) {
+        return res.status(400).json({ message: 'Unknown droneId — has it sent telemetry yet?' });
+    }
+    swarmLeaderId = droneId || null;
+    const followers = Object.keys(drones).filter((id) => id !== swarmLeaderId);
+    io.emit('leader_update', { leaderId: swarmLeaderId, followerOrder: followers, updatedAt: Date.now() });
+    res.status(200).json({ leaderId: swarmLeaderId, followerOrder: followers });
+});
+
+app.get('/api/leader', (req, res) => {
+    const followers = Object.keys(drones).filter((id) => id !== swarmLeaderId);
+    res.status(200).json({ leaderId: swarmLeaderId, followerOrder: followers });
+});
+
+// Only the currently-designated leader (checked server-side, not just
+// trusted from the request) may push swarm targets. This stops a stale
+// or spoofed client from commanding the fleet after leadership changes.
+app.post('/api/swarm/target', (req, res) => {
+    const { leaderId, targets } = req.body || {};
+    if (!leaderId || leaderId !== swarmLeaderId) {
+        return res.status(403).json({ message: 'Only the currently-designated leader may broadcast swarm targets' });
+    }
+    if (!Array.isArray(targets)) {
+        return res.status(400).json({ message: 'targets must be an array' });
+    }
+    io.emit('swarm_target', { leaderId, targets, updatedAt: Date.now() });
+    res.status(200).json({ message: 'relayed', count: targets.length });
 });
 
 app.delete('/api/drones/:droneId', (req, res) => {
@@ -1185,9 +1225,11 @@ app.get('/dashboard', (req, res) => {
                     ${clientCoreScript()}
                     initThemeToggle('themeToggle');
 
-                    const dronesById = {};
-                    let selectedDroneId = null;
-                let livePlayer = null;
+           const dronesById = {};
+                               let selectedDroneId = null;
+                           let livePlayer = null;
+                           let swarmLeaderIdClient = null;
+                           fetch('/api/leader').then(r => r.json()).then(d => { swarmLeaderIdClient = d.leaderId; renderFleetList(); }).catch(() => {});
                 try { selectedDroneId = localStorage.getItem('ffly_selected_drone') || null; } catch (e) {}
 
                 // ---------- Map ----------
@@ -1224,14 +1266,27 @@ app.get('/dashboard', (req, res) => {
                         const online = (Date.now() - (d.lastUpdate || 0)) < 15000;
                         const sel = id === selectedDroneId ? 'selected' : '';
                         const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
-               return '<div class="drone-card ' + sel + '" data-id="' + id + '">' +
-                                           '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
-                                           '<div class="info"><div class="name">' + (d.name || id) + '</div>' +
-                                           '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + camelCount + ' tracked</div></div>' +
-                                           '<div class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</div>' +
-                                           (online ? '' : '<button class="drone-delete-btn" data-id="' + id + '" title="Remove offline drone">✕</button>') +
-                                       '</div>';
-                                   }).join('');
+             const isLeader = id === swarmLeaderIdClient;
+                            return '<div class="drone-card ' + sel + '" data-id="' + id + '">' +
+                                                        '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
+                                                        '<div class="info"><div class="name">' + (d.name || id) + (isLeader ? ' ★ LEADER' : '') + '</div>' +
+                                                        '<div class="meta">' + fmtNum(d.drone?.alt, 1) + 'm &middot; ' + camelCount + ' tracked</div></div>' +
+                                                        '<div class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</div>' +
+                                                        '<button class="drone-leader-btn" data-id="' + id + '" title="Make this drone the swarm leader">' + (isLeader ? '★' : '☆') + '</button>' +
+                                                        (online ? '' : '<button class="drone-delete-btn" data-id="' + id + '" title="Remove offline drone">✕</button>') +
+                                                    '</div>';
+                                                }).join('');
+                                                list.querySelectorAll('.drone-leader-btn').forEach((btn) => {
+                                                    btn.addEventListener('click', (e) => {
+                                                        e.stopPropagation();
+                                                        const id = btn.getAttribute('data-id');
+                                                        const nextLeader = swarmLeaderIdClient === id ? null : id; // tap again to clear
+                                                        fetch('/api/leader', {
+                                                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                            body: JSON.stringify({ droneId: nextLeader })
+                                                        }).catch((err) => console.error('Failed to set leader', err));
+                                                    });
+                                                });
 
                                    list.querySelectorAll('.drone-card').forEach((el) => {
                                        el.addEventListener('click', () => selectDrone(el.getAttribute('data-id')));
@@ -1366,7 +1421,11 @@ app.get('/dashboard', (req, res) => {
                 }
 
                 const socket = setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
-                socket.on('control_command', (entry) => {
+               socket.on('leader_update', (payload) => {
+                                   swarmLeaderIdClient = payload.leaderId;
+                                   renderFleetList();
+                               });
+                               socket.on('control_command', (entry) => {
                     if (entry.droneId === selectedDroneId) {
                         setCommandStatus(entry.command + (entry.params ? ' ' + JSON.stringify(entry.params) : '') + ' confirmed (id: ' + entry.commandId + ')', 'var(--green)');
                     }
