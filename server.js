@@ -671,17 +671,32 @@ function sharedStyles() {
         .fw-card .fw-telemetry .warn { color: var(--amber); }
         .fw-card .fw-telemetry .accent { color: var(--cyan); }
 
-        /* ---- map wall ---- */
-        .mw-layout {
-            flex: 1 1 auto;
-            min-height: 0;
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 20px;
-            padding: 20px 28px 28px;
-        }
-        .mw-popup { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; }
-        .mw-popup b { color: #0d1117; }
+       /* ---- map wall ---- */
+               .mw-layout {
+                   flex: 1 1 auto;
+                   min-height: 0;
+                   display: grid;
+                   grid-template-columns: 1fr 320px;
+                   gap: 20px;
+                   padding: 20px 28px 28px;
+               }
+               @media (max-width: 980px) {
+                   .mw-layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+               }
+               .mw-popup { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; }
+               .mw-popup b { color: #0d1117; }
+
+               .mw-telemetry-list { overflow-y: auto; }
+               .mw-telemetry-empty { padding: 24px 18px; color: var(--text-faint); font-size: 13px; line-height: 1.6; }
+               .mw-drone-row { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+               .mw-drone-row:last-child { border-bottom: none; }
+               .mw-drone-row .mw-row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+               .mw-drone-row .mw-row-head .name { font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 600; flex: 1; }
+               .mw-drone-row .mw-row-head .status { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); }
+               .mw-row-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-dim); }
+               .mw-row-stats b { color: var(--text); font-weight: 600; }
+               .mw-row-stats .warn { color: var(--amber); }
+               .mw-row-stats .accent { color: var(--cyan); }
     `;
 }
 
@@ -2035,21 +2050,28 @@ app.get('/map-wall', (req, res) => {
         </head>
         <body>
             ${topBar(0, 'map-wall')}
-            <div class="mw-layout">
-                <div class="panel">
-                    <div class="panel-header">
-                        <h3>Fleet Satellite Map</h3>
-                        <span class="mono" style="font-size:11px;color:var(--text-faint);" id="mwCount">0 drones &middot; 0 camels tracked</span>
-                    </div>
-                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
-                        <div id="mwMap"></div>
-                        <div class="map-legend">
-                            <div class="row"><span class="swatch fov"></span>camera FOV</div>
-                            <div class="row"><span class="swatch camel"></span>camel tracked</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
+      <div class="mw-layout">
+                      <div class="panel">
+                          <div class="panel-header">
+                              <h3>Fleet Satellite Map</h3>
+                              <span class="mono" style="font-size:11px;color:var(--text-faint);" id="mwCount">0 drones &middot; 0 camels tracked</span>
+                          </div>
+                          <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                              <div id="mwMap"></div>
+                              <div class="map-legend">
+                                  <div class="row"><span class="swatch fov"></span>camera FOV</div>
+                                  <div class="row"><span class="swatch camel"></span>camel tracked</div>
+                              </div>
+                          </div>
+                      </div>
+
+                      <div class="panel">
+                          <div class="panel-header"><h3>All Telemetry</h3></div>
+                          <div class="mw-telemetry-list scrollbar" id="mwTelemetryList">
+                              <div class="mw-telemetry-empty">Waiting for the first telemetry packet from any drone…</div>
+                          </div>
+                      </div>
+                  </div>
 
             <script>
                 ${clientCoreScript()}
@@ -2138,7 +2160,7 @@ app.get('/map-wall', (req, res) => {
                     camels.forEach((c) => {
                         if (typeof c.lat === 'number' && typeof c.lng === 'number') {
                             L.circleMarker([c.lat, c.lng], {
-                                radius: 5, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.9, interactive: false
+                                radius: 5, color: '#e5484d', weight: 1, fillColor: '# e5484d', fillOpacity: 0.9, interactive: false
                             }).addTo(camelLayers[id]);
                         }
                     });
@@ -2152,42 +2174,82 @@ app.get('/map-wall', (req, res) => {
                     });
                 }
 
-                function updateSummary() {
-                    const ids = Object.keys(dronesById);
-                    const camelTotal = ids.reduce((sum, id) => {
-                        const d = dronesById[id];
-                        return sum + (Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0));
-                    }, 0);
-                    document.getElementById('mwCount').innerText = ids.length + ' drones \u00b7 ' + camelTotal + ' camels tracked';
-                    const countEl = document.getElementById('fleetCount');
-                    if (countEl) countEl.innerText = ids.length;
-                }
+               function updateSummary() {
+                                   const ids = Object.keys(dronesById);
+                                   const camelTotal = ids.reduce((sum, id) => {
+                                       const d = dronesById[id];
+                                       return sum + (Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0));
+                                   }, 0);
+                                   document.getElementById('mwCount').innerText = ids.length + ' drones \u00b7 ' + camelTotal + ' camels tracked';
+                                   const countEl = document.getElementById('fleetCount');
+                                   if (countEl) countEl.innerText = ids.length;
+                               }
 
-       function applyUpdate(data) {
-                           const id = data.droneId || 'drone-1';
-                           const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
-                           dronesById[id] = data;
-                           try {
-                               upsertDrone(id, data);
-                           } catch (e) {
-                               console.error('[map-wall] error updating drone', id, e);
+                               // Renders full telemetry for EVERY connected drone at once, so
+                               // the map view surfaces the whole fleet's telemetry
+                               // simultaneously instead of one popup at a time.
+                               function renderTelemetryList() {
+                                   const list = document.getElementById('mwTelemetryList');
+                                   const ids = Object.keys(dronesById);
+                                   if (ids.length === 0) {
+                                       list.innerHTML = '<div class="mw-telemetry-empty">Waiting for the first telemetry packet from any drone…</div>';
+                                       return;
+                                   }
+                                   list.innerHTML = ids.map((id) => {
+                                       const d = dronesById[id];
+                                       const online = isOnline(d);
+                                       const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
+                                       const hasFix = !!d.drone?.hasGPSFix;
+                                       return '<div class="mw-drone-row">' +
+                                           '<div class="mw-row-head">' +
+                                               '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
+                                               '<span class="name">' + (d.name || id) + '</span>' +
+                                               '<span class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</span>' +
+                                           '</div>' +
+                                           '<div class="mw-row-stats">' +
+                                               '<span>lat <b>' + fmtNum(d.drone?.lat, 6) + '</b></span>' +
+                                               '<span>lng <b>' + fmtNum(d.drone?.lng, 6) + '</b></span>' +
+                                               '<span>alt <b>' + fmtNum(d.drone?.alt, 1) + 'm</b></span>' +
+                                               '<span>yaw <b>' + fmtNum(d.drone?.yaw, 0) + '°</b></span>' +
+                                               '<span>gimbal <b>' + fmtNum(d.drone?.pitch, 0) + '°</b></span>' +
+                                               '<span>roll <b>' + fmtNum(d.drone?.roll, 0) + '°</b></span>' +
+                                               '<span>gps <b class="' + (hasFix ? 'accent' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
+                                               '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
+                                           '</div>' +
+                                       '</div>';
+                                   }).join('');
+                               }
+
+    function applyUpdate(data) {
+                               const id = data.droneId || 'drone-1';
+                               const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
+                               dronesById[id] = data;
+                               try {
+                                   upsertDrone(id, data);
+                               } catch (e) {
+                                   console.error('[map-wall] error updating drone', id, e);
+                               }
+                               updateSummary();
+                               renderTelemetryList();
+
+                               // Center the map on the very first GPS fix we ever see, so
+                               // the page doesn't sit on the default fallback coordinates
+                               // once real telemetry starts arriving.
+                               if (isFirstFixForFleet) {
+                                   didInitialFit = true;
+                                   map.setView([data.drone.lat, data.drone.lng], 17);
+                               }
                            }
-                           updateSummary();
 
-                           // Center the map on the very first GPS fix we ever see, so
-                           // the page doesn't sit on the default fallback coordinates
-                           // once real telemetry starts arriving.
-                           if (isFirstFixForFleet) {
-                               didInitialFit = true;
-                               map.setView([data.drone.lat, data.drone.lng], 17);
-                           }
-                       }
+                    setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
 
-                setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
-
-                // Periodic sweep so a drone's marker dims to "offline" purely
-                // from the passage of time, without needing a new packet.
-                setInterval(removeStale, 5000);
+                    // Periodic sweep so a drone's marker dims to "offline" purely
+                    // from the passage of time, and so the telemetry list's
+                    // online/offline state stays accurate between packets too.
+                    setInterval(() => {
+                        removeStale();
+                        renderTelemetryList();
+                    }, 5000);
             </script>
         </body>
         </html>
