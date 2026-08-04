@@ -37,8 +37,140 @@ nms.run();
 // ==========================================
 // 1. DATA STORAGE & LOGGING
 // ==========================================
-const LOG_FILE = path.join(__dirname, 'drone_log.txt');
+const DRONE_LOG_DIR = path.join(__dirname, 'logs');
 const CONTROL_LOG_FILE = path.join(__dirname, 'control_log.txt');
+
+// Every drone's full telemetry stream (camels, camera FOV, armed state,
+// gimbal/yaw — everything sent to /api/telemetry, normalized exactly like
+// the live pages see it) is appended as one JSON line per packet, organized
+// as drone_log/<droneId>/<YYYY-MM-DD>.jsonl. The History Wall reads these
+// back to replay a flight; nothing is ever overwritten, only appended.
+function droneLogDir(droneId) {
+    return path.join(DRONE_LOG_DIR, String(droneId).replace(/[^a-zA-Z0-9_-]/g, '_'));
+}
+function droneLogFilePath(droneId, dateObj) {
+    const dateStr = dateObj.toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+    return path.join(droneLogDir(droneId), `${dateStr}.jsonl`);
+}
+function appendDroneLog(droneId, record) {
+    const dir = droneLogDir(droneId);
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = droneLogFilePath(droneId, new Date(record.ts));
+    fs.appendFile(filePath, JSON.stringify(record) + '\n', (err) => {
+        if (err) console.error('Failed to write drone log:', filePath, err);
+    });
+}
+
+// ==========================================
+// FOV camera model constants — DJI Mini 5 Pro-equivalent 1" sensor, matching
+// the client-side preciseFovPolygon() in clientCoreScript(). Computed
+// server-side so every 10Hz log snapshot already carries its footprint
+// polygon — the History Wall doesn't need to redo frustum math per frame.
+// ==========================================
+const SERVER_FOV_SENSOR_WIDTH_MM = 13.2;
+const SERVER_FOV_SENSOR_HEIGHT_MM = 8.8;
+const SERVER_FOV_FOCAL_LENGTH_MM = 8.8;
+const SERVER_FOV_H_DEG = 2 * Math.atan((SERVER_FOV_SENSOR_WIDTH_MM / 2) / SERVER_FOV_FOCAL_LENGTH_MM) * 180 / Math.PI;
+const SERVER_FOV_V_DEG = 2 * Math.atan((SERVER_FOV_SENSOR_HEIGHT_MM / 2) / SERVER_FOV_FOCAL_LENGTH_MM) * 180 / Math.PI;
+const SERVER_EARTH_RADIUS_M = 6378137.0;
+
+function serverMatMul3(a, b) {
+    const r = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++)
+        for (let j = 0; j < 3; j++) {
+            let sum = 0;
+            for (let k = 0; k < 3; k++) sum += a[i][k] * b[k][j];
+            r[i][j] = sum;
+        }
+    return r;
+}
+
+function serverMatVecMul(m, v) {
+    return [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]
+    ];
+}
+
+function serverRotationMatrix(yawDeg, pitchDeg, rollDeg) {
+    const yaw = (yawDeg || 0) * Math.PI / 180;
+    const pitch = (pitchDeg || 0) * Math.PI / 180;
+    const roll = (rollDeg || 0) * Math.PI / 180;
+    const Rz = [[Math.cos(yaw), Math.sin(yaw), 0], [-Math.sin(yaw), Math.cos(yaw), 0], [0, 0, 1]];
+    const Rx = [[1, 0, 0], [0, Math.cos(pitch), -Math.sin(pitch)], [0, Math.sin(pitch), Math.cos(pitch)]];
+    const Ry = [[Math.cos(roll), 0, Math.sin(roll)], [0, 1, 0], [-Math.sin(roll), 0, Math.cos(roll)]];
+    return serverMatMul3(serverMatMul3(Rz, Rx), Ry);
+}
+
+function serverAddMetersToLatLon(lat, lon, dx, dy) {
+    const dLat = (dy / SERVER_EARTH_RADIUS_M) * (180 / Math.PI);
+    const dLon = (dx / (SERVER_EARTH_RADIUS_M * Math.cos(lat * Math.PI / 180))) * (180 / Math.PI);
+    return [lat + dLat, lon + dLon];
+}
+
+// Server-side port of the client's preciseFovPolygon(). pitchDeg defaults to
+// straight-down (-90) when missing, matching the client's convention.
+function computeFovPolygonServer(lat, lng, altM, yawDeg, pitchDeg, rollDeg) {
+    if (typeof lat !== 'number' || typeof lng !== 'number') return [];
+    const alt = Math.max(1, altM || 10);
+    const pitch = (pitchDeg === null || pitchDeg === undefined || isNaN(pitchDeg)) ? -90 : pitchDeg;
+    const h = Math.tan(SERVER_FOV_H_DEG / 2 * Math.PI / 180);
+    const v = Math.tan(SERVER_FOV_V_DEG / 2 * Math.PI / 180);
+    const vectors = [[-h, 1, v], [h, 1, v], [h, 1, -v], [-h, 1, -v]];
+    const R = serverRotationMatrix(yawDeg, pitch, rollDeg);
+    return vectors.map((vec) => {
+        const vw = serverMatVecMul(R, vec);
+        let scale;
+        if (vw[2] >= 0) {
+            const ray2d = Math.hypot(vw[0], vw[1]) || 0.0001;
+            scale = 2000.0 / ray2d;
+        } else {
+            scale = -alt / vw[2];
+        }
+        return serverAddMetersToLatLon(lat, lng, scale * vw[0], scale * vw[1]);
+    });
+}
+
+// ==========================================
+// HIGH-FREQUENCY HISTORY LOGGER (10Hz)
+// The aircraft only POSTs telemetry ~1x/second, but the History Wall needs
+// smooth scrubbing at any speed. Every 100ms, for every drone that has
+// reported within HISTORY_LOG_STALE_MS, this writes ONE full snapshot to
+// that drone's log — normalized camels, the precomputed FOV footprint
+// polygon, and every other field — re-logging the last known state between
+// real packets so no scrub position ever lands on a gap.
+// ==========================================
+const HISTORY_LOG_INTERVAL_MS = 100;
+const HISTORY_LOG_STALE_MS = 60000; // stop logging a drone 60s after its last real packet
+
+setInterval(() => {
+    const now = Date.now();
+    Object.keys(drones).forEach((droneId) => {
+        const d = drones[droneId];
+        if (!d || !d.lastUpdate || (now - d.lastUpdate) > HISTORY_LOG_STALE_MS) return;
+
+        const lat = d.drone?.lat, lng = d.drone?.lng;
+        const alt = d.drone?.alt, yaw = d.drone?.yaw, pitch = d.drone?.pitch, roll = d.drone?.roll;
+        const camels = normalizeCamels(d.camels);
+        const fovDeg = (typeof d.camera?.fovDeg === 'number') ? d.camera.fovDeg : DEFAULT_FOV_DEG;
+        const polygonFootprint = computeFovPolygonServer(lat, lng, alt, yaw, pitch, roll);
+
+        appendDroneLog(droneId, {
+            ts: now,
+            droneId,
+            name: d.name || droneId,
+            streamKey: d.streamKey || droneId,
+            drone: d.drone || {},
+            camels,
+            camelCount: camels.length,
+            fovDeg,
+            polygonFootprint,
+            isLive: !!d.isLive,
+            armed: !!d.armed
+        });
+    });
+}, HISTORY_LOG_INTERVAL_MS);
 const DEFAULT_DRONE_ID = 'drone-1';
 const OFFLINE_AFTER_MS = 15000; // a drone with no telemetry in this window is shown as offline
 const DEFAULT_FOV_DEG = 78; // typical FPV/action-cam horizontal field of view
@@ -129,31 +261,31 @@ app.post('/api/telemetry', (req, res) => {
     const networkDelay = serverReceiveTime - clientTimestamp;
 
     const record = {
-        ...body,
-        droneId,
-        streamKey: body.streamKey || droneId,
-        lastUpdate: serverReceiveTime
-    };
-    drones[droneId] = record;
+            ...body,
+            droneId,
+            streamKey: body.streamKey || droneId,
+            lastUpdate: serverReceiveTime
+        };
+        drones[droneId] = record;
 
-    const logEntry = `[${new Date().toISOString()}] [${droneId}] [Delay: ${networkDelay}ms] ${JSON.stringify(record)}\n`;
-    fs.appendFile(LOG_FILE, logEntry, (err) => {
-        if (err) console.error('Failed to write to log file:', err);
-    });
-
-    // Emit the normalized shape (with camels positions + fovDeg resolved) so
-    // every connected client — including ones that just reconnected — gets
-    // a consistent record, whether it came from a live socket push or a
-    // fresh /api/drones fetch after a page refresh. This SAME event feeds
-    // the Dashboard, the Video Wall, and the Map Wall, so all three pages
-    // always agree on position, FOV, camels, and stream key.
-    const emitRecord = {
-        ...record,
-        camels: normalizeCamels(record.camels),
-        camelCount: Array.isArray(record.camels) ? record.camels.length : 0,
-        fovDeg: (typeof record.camera?.fovDeg === 'number') ? record.camera.fovDeg : DEFAULT_FOV_DEG
-    };
+        // Emit the normalized shape (with camels positions + fovDeg resolved) so
+        // every connected client — including ones that just reconnected — gets
+        // a consistent record, whether it came from a live socket push or a
+        // fresh /api/drones fetch after a page refresh. This SAME event feeds
+        // the Dashboard, the Video Wall, and the Map Wall, so all three pages
+        // always agree on position, FOV, camels, and stream key.
+        const emitRecord = {
+            ...record,
+            camels: normalizeCamels(record.camels),
+            camelCount: Array.isArray(record.camels) ? record.camels.length : 0,
+            fovDeg: (typeof record.camera?.fovDeg === 'number') ? record.camera.fovDeg : DEFAULT_FOV_DEG
+        };
     io.emit('telemetry_update', emitRecord);
+
+        // Per-packet history logging has been superseded by the 10Hz interval
+        // logger above, which writes a full snapshot — including the FOV
+        // footprint polygon — every 100ms for every drone currently reporting,
+        // regardless of how often /api/telemetry itself is called.
 
     res.status(200).json({
         message: 'Data received and logged',
@@ -169,6 +301,95 @@ app.post('/api/telemetry', (req, res) => {
 // "disappear" from any of the three views.
 app.get('/api/drones', (req, res) => {
     res.status(200).json(fleetSummary());
+});
+
+// ==========================================
+// 3a. HISTORY QUERY — powers the History Wall's timeline scrubber/playback.
+// Reads directly from the per-drone, per-day .jsonl files written by
+// appendDroneLog() above — no separate history database to keep in sync.
+// ==========================================
+function listDroneIds() {
+    if (!fs.existsSync(DRONE_LOG_DIR)) return [];
+    return fs.readdirSync(DRONE_LOG_DIR).filter((name) => fs.statSync(path.join(DRONE_LOG_DIR, name)).isDirectory());
+}
+
+function listLogDatesForDrone(droneId) {
+    const dir = droneLogDir(droneId);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+        .filter((f) => f.endsWith('.jsonl'))
+        .map((f) => f.replace('.jsonl', ''))
+        .sort();
+}
+
+function readJsonlLines(filePath) {
+    if (!fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const records = [];
+    raw.split('\n').filter(Boolean).forEach((line) => {
+        try { records.push(JSON.parse(line)); } catch (e) { /* skip corrupt line */ }
+    });
+    return records;
+}
+
+// Full available date range across every drone's logs, so the History
+// Wall's start/end date boxes default to something real instead of an
+// arbitrary hardcoded range.
+app.get('/api/history/range', (req, res) => {
+    const droneIds = listDroneIds();
+    let earliest = null;
+    let latest = null;
+
+    droneIds.forEach((droneId) => {
+        const dates = listLogDatesForDrone(droneId);
+        if (dates.length === 0) return;
+        const firstRecords = readJsonlLines(droneLogDir(droneId) + '/' + dates[0] + '.jsonl');
+        const lastRecords = readJsonlLines(droneLogDir(droneId) + '/' + dates[dates.length - 1] + '.jsonl');
+        if (firstRecords.length) {
+            const ts = firstRecords[0].ts;
+            if (earliest === null || ts < earliest) earliest = ts;
+        }
+        if (lastRecords.length) {
+            const ts = lastRecords[lastRecords.length - 1].ts;
+            if (latest === null || ts > latest) latest = ts;
+        }
+    });
+
+    res.status(200).json({
+        droneIds,
+        earliest: earliest ? new Date(earliest).toISOString() : null,
+        latest: latest ? new Date(latest).toISOString() : null
+    });
+});
+
+// Returns every logged telemetry packet (across all drones) between start
+// and end (ISO timestamps, inclusive), sorted by time. The History Wall
+// loads this once per date-range selection, then scrubs/plays through it
+// entirely client-side — no per-frame server round trip while playing.
+app.get('/api/history/query', (req, res) => {
+    const startMs = req.query.start ? Date.parse(req.query.start) : NaN;
+    const endMs = req.query.end ? Date.parse(req.query.end) : NaN;
+    if (isNaN(startMs) || isNaN(endMs)) {
+        return res.status(400).json({ message: 'start and end query params must be valid ISO timestamps' });
+    }
+
+    const droneIds = listDroneIds();
+    let records = [];
+
+    droneIds.forEach((droneId) => {
+        listLogDatesForDrone(droneId).forEach((dateStr) => {
+            // Cheap pre-filter: skip files entirely outside the requested range.
+            const fileDayMs = Date.parse(dateStr + 'T00:00:00.000Z');
+            if (fileDayMs > endMs || fileDayMs + 86400000 < startMs) return;
+
+            const dayRecords = readJsonlLines(droneLogDir(droneId) + '/' + dateStr + '.jsonl')
+                .filter((r) => r.ts >= startMs && r.ts <= endMs);
+            records = records.concat(dayRecords);
+        });
+    });
+
+    records.sort((a, b) => a.ts - b.ts);
+    res.status(200).json({ count: records.length, records });
 });
 
 // ==========================================
@@ -496,7 +717,7 @@ function sharedStyles() {
         }
         @media (max-width: 980px) { .quad { grid-template-columns: 1fr; grid-template-rows: repeat(4, minmax(220px, 1fr)); overflow-y: auto; } }
 
-        #map, #mwMap { flex: 1 1 auto; min-height: 0; width: 100%; border-radius: 0 0 var(--radius) var(--radius); }
+        #map, #mwMap, #hwMap { flex: 1 1 auto; min-height: 0; width: 100%; border-radius: 0 0 var(--radius) var(--radius); }
 
         .map-legend {
             position: absolute; left: 8px; bottom: 8px; z-index: 500;
@@ -714,9 +935,10 @@ function topBar(fleetCount, activeNav) {
                 </div>
             </div>
             <div class="topbar-right">
-                ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
-                ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
-                ${navLink('/map-wall', 'MAP WALL', 'map-wall')}
+               ${navLink('/dashboard', 'DASHBOARD', 'dashboard')}
+                               ${navLink('/video-wall', 'VIDEO WALL', 'video-wall')}
+                               ${navLink('/map-wall', 'MAP WALL', 'map-wall')}
+                               ${navLink('/history-wall', 'HISTORY WALL', 'history-wall')}
                <button class="nav-link" id="themeToggle" type="button">☀ LIGHT</button>
                                <span class="conn-pill" id="connPill"><span class="dot online"></span><span id="connLabel">connecting…</span></span>
                                <span class="fleet-pill"><span class="dot online"></span><span id="fleetCount">${fleetCount}</span> in fleet</span>
@@ -755,7 +977,38 @@ function clientCoreScript() {
             });
         }
 
-        // ---------- geo math ----------
+        // ---------- never show "—": persistent last-known-value cache ----------
+                // A telemetry field can be transiently missing (dropped packet, a
+                // field not yet reported, a brief gap) — that used to render as
+                // "—", indistinguishable from an actual zero reading. This keeps
+                // the last real value seen per scope (droneId) and field, and every
+                // render call below merges it in first, so a display never
+                // regresses to a dash once real data has arrived even once.
+                const __lastKnownDroneState = {};
+                function mergeWithLastKnown(scopeKey, drone) {
+                    const prev = __lastKnownDroneState[scopeKey] || {};
+                    const fields = ['lat', 'lng', 'alt', 'yaw', 'pitch', 'roll', 'hasGPSFix'];
+                    const merged = {};
+                    fields.forEach((f) => {
+                        const v = drone ? drone[f] : undefined;
+                        const isValid = (f === 'hasGPSFix') ? (typeof v === 'boolean') : (typeof v === 'number' && !isNaN(v));
+                        merged[f] = isValid ? v : prev[f];
+                    });
+                    __lastKnownDroneState[scopeKey] = merged;
+                    return merged;
+                }
+
+                const __lastKnownCamelCount = {};
+                function mergeCamelCount(scopeKey, camels, camelCountField) {
+                    const count = Array.isArray(camels) ? camels.length : camelCountField;
+                    if (typeof count === 'number' && !isNaN(count)) {
+                        __lastKnownCamelCount[scopeKey] = count;
+                        return count;
+                    }
+                    return __lastKnownCamelCount[scopeKey] || 0;
+                }
+
+                // ---------- geo math ----------
         // Great-circle destination point given a start point, bearing, and
         // distance — used as a fallback when we only have a bare fovDeg (no
         // gimbal pitch/roll) to draw with.
@@ -1224,14 +1477,14 @@ app.get('/dashboard', (req, res) => {
                     <div class="panel">
                         <div class="panel-header"><h3>Telemetry</h3></div>
                         <div class="telemetry-grid">
-                            <div class="stat-card"><h4>Latitude</h4><div class="value accent" id="lat">—</div></div>
-                            <div class="stat-card"><h4>Longitude</h4><div class="value accent" id="lng">—</div></div>
-                            <div class="stat-card"><h4>Altitude</h4><div class="value" id="alt">—</div></div>
-                            <div class="stat-card"><h4>Heading</h4><div class="value" id="yaw">—</div></div>
-                            <div class="stat-card"><h4>Gimbal</h4><div class="value" id="pitch">—</div></div>
-                            <div class="stat-card"><h4>Camels</h4><div class="value" id="camels">—</div></div>
-                            <div class="stat-card"><h4>GPS Fix</h4><div class="value" id="gps">—</div></div>
-                            <div class="stat-card"><h4>State</h4><div class="value warn" id="armState">—</div></div>
+                            <div class="stat-card"><h4>Latitude</h4><div class="value accent" id="lat">0.000000</div></div>
+                                                        <div class="stat-card"><h4>Longitude</h4><div class="value accent" id="lng">0.000000</div></div>
+                                                        <div class="stat-card"><h4>Altitude</h4><div class="value" id="alt">0.0 m</div></div>
+                                                        <div class="stat-card"><h4>Heading</h4><div class="value" id="yaw">0.0°</div></div>
+                                                        <div class="stat-card"><h4>Gimbal</h4><div class="value" id="pitch">0.0°</div></div>
+                                                        <div class="stat-card"><h4>Camels</h4><div class="value" id="camels">0</div></div>
+                                                        <div class="stat-card"><h4>GPS Fix</h4><div class="value" id="gps">NO FIX</div></div>
+                                                        <div class="stat-card"><h4>State</h4><div class="value warn" id="armState">STANDBY</div></div>
                         </div>
                     </div>
                 </div>
@@ -1265,9 +1518,9 @@ app.get('/dashboard', (req, res) => {
                     });
                 }
 
-                function fmtNum(n, digits) {
-                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
-                }
+              function fmtNum(n, digits) {
+                                  return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits);
+                              }
 
                 // ---------- Fleet list (drone picker) ----------
                 function renderFleetList() {
@@ -1357,18 +1610,20 @@ app.get('/dashboard', (req, res) => {
                 }
 
                 // ---------- Telemetry panel (shows the currently selected drone) ----------
-                function updateTelemetryPanel() {
-                    const d = selectedDroneId ? dronesById[selectedDroneId] : null;
-                    const camelCount = d ? (Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0)) : null;
-                    document.getElementById('lat').innerText = d ? fmtNum(d.drone?.lat, 6) : '—';
-                    document.getElementById('lng').innerText = d ? fmtNum(d.drone?.lng, 6) : '—';
-                    document.getElementById('alt').innerText = d ? fmtNum(d.drone?.alt, 1) + ' m' : '—';
-                    document.getElementById('yaw').innerText = d ? fmtNum(d.drone?.yaw, 1) + '°' : '—';
-                    document.getElementById('pitch').innerText = d ? fmtNum(d.drone?.pitch, 1) + '°' : '—';
-                    document.getElementById('camels').innerText = camelCount === null ? '—' : camelCount;
-                    document.getElementById('gps').innerText = d ? (d.drone?.hasGPSFix ? 'LOCKED' : 'NO FIX') : '—';
-                    document.getElementById('armState').innerText = d ? (d.armed ? 'ARMED' : 'STANDBY') : '—';
-                }
+            function updateTelemetryPanel() {
+                                const d = selectedDroneId ? dronesById[selectedDroneId] : null;
+                                const scopeKey = selectedDroneId || 'none';
+                                const merged = mergeWithLastKnown(scopeKey, d ? d.drone : null);
+                                const camelCount = mergeCamelCount(scopeKey, d ? d.camels : null, d ? d.camelCount : null);
+                                document.getElementById('lat').innerText = fmtNum(merged.lat, 6);
+                                document.getElementById('lng').innerText = fmtNum(merged.lng, 6);
+                                document.getElementById('alt').innerText = fmtNum(merged.alt, 1) + ' m';
+                                document.getElementById('yaw').innerText = fmtNum(merged.yaw, 1) + '°';
+                                document.getElementById('pitch').innerText = fmtNum(merged.pitch, 1) + '°';
+                                document.getElementById('camels').innerText = camelCount;
+                                document.getElementById('gps').innerText = merged.hasGPSFix ? 'LOCKED' : 'NO FIX';
+                                document.getElementById('armState').innerText = d ? (d.armed ? 'ARMED' : 'STANDBY') : 'STANDBY';
+                            }
 
                 function upsertMarker(id, d) {
                     if (!d.drone || !d.drone.lat || !d.drone.lng) return;
@@ -1603,10 +1858,9 @@ app.get('/video-wall', (req, res) => {
                 const cardEls = {};      // droneId -> cached element references for this card (see cacheCardEls)
                 const OFFLINE_AFTER_MS = 15000;
 
-                function fmtNum(n, digits) {
-                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
-                }
-
+             function fmtNum(n, digits) {
+                                 return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits);
+                             }
                 // Turns an arbitrary droneId (which may contain spaces, slashes,
                 // or other characters some DJI apps send in a device name) into
                 // a safe string for use in an HTML id attribute. Two different
@@ -1762,17 +2016,18 @@ app.get('/video-wall', (req, res) => {
                 }
 
                 // ---------- telemetry fields (shared by full card build + in-place update) ----------
-                function telemetryFieldsHTML(d) {
-                    const hasFix = !!d.drone?.hasGPSFix && typeof d.drone?.lat === 'number';
-                    const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
-                    return '<span>alt <b>' + fmtNum(d.drone?.alt, 1) + 'm</b></span>' +
-                        '<span>yaw <b>' + fmtNum(d.drone?.yaw, 0) + '°</b></span>' +
-                        '<span>gimbal <b>' + fmtNum(d.drone?.pitch, 0) + '°</b></span>' +
-                        '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
-                        '<span>gps <b class="' + (hasFix ? '' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
-                        '<span>state <b class="' + (d.armed ? 'warn' : '') + '">' + (d.armed ? 'ARMED' : 'STANDBY') + '</b></span>';
-                }
-
+    function telemetryFieldsHTML(d) {
+                        const scopeKey = d.droneId || 'unknown';
+                        const merged = mergeWithLastKnown(scopeKey, d.drone);
+                        const camelCount = mergeCamelCount(scopeKey, d.camels, d.camelCount);
+                        const hasFix = !!merged.hasGPSFix && typeof merged.lat === 'number';
+                        return '<span>alt <b>' + fmtNum(merged.alt, 1) + 'm</b></span>' +
+                            '<span>yaw <b>' + fmtNum(merged.yaw, 0) + '°</b></span>' +
+                            '<span>gimbal <b>' + fmtNum(merged.pitch, 0) + '°</b></span>' +
+                            '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
+                            '<span>gps <b class="' + (hasFix ? '' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
+                            '<span>state <b class="' + (d.armed ? 'warn' : '') + '">' + (d.armed ? 'ARMED' : 'STANDBY') + '</b></span>';
+                    }
                 // ---------- card markup ----------
                 // Mirrors the dashboard's Live Feed panel: the <video> element
                 // is ALWAYS in the DOM (never conditionally left out), and a
@@ -2093,9 +2348,9 @@ app.get('/map-wall', (req, res) => {
                     attribution: 'Satellite imagery via local tile cache'
                 }).addTo(map);
 
-                function fmtNum(n, digits) {
-                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : '—';
-                }
+               function fmtNum(n, digits) {
+                                   return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits);
+                               }
 
                 function isOnline(d) {
                     return (Date.now() - (d.lastUpdate || 0)) < 15000;
@@ -2111,19 +2366,20 @@ app.get('/map-wall', (req, res) => {
                     });
                 }
 
-                function popupHTML(id, d) {
-                    const online = isOnline(d);
-                    const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
-                    return '<div class="mw-popup">' +
-                        '<b>' + (d.name || id) + '</b><br/>' +
-                        'status: ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '<br/>' +
-                        'alt: ' + fmtNum(d.drone?.alt, 1) + ' m<br/>' +
-                        'yaw: ' + fmtNum(d.drone?.yaw, 0) + '°<br/>' +
-                        'gimbal: ' + fmtNum(d.drone?.pitch, 0) + '°<br/>' +
-                        'gps: ' + (d.drone?.hasGPSFix ? 'LOCKED' : 'NO FIX') + '<br/>' +
-                        'camels tracked: ' + camelCount +
-                    '</div>';
-                }
+               function popupHTML(id, d) {
+                                   const online = isOnline(d);
+                                   const merged = mergeWithLastKnown(id, d.drone);
+                                   const camelCount = mergeCamelCount(id, d.camels, d.camelCount);
+                                   return '<div class="mw-popup">' +
+                                       '<b>' + (d.name || id) + '</b><br/>' +
+                                       'status: ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '<br/>' +
+                                       'alt: ' + fmtNum(merged.alt, 1) + ' m<br/>' +
+                                       'yaw: ' + fmtNum(merged.yaw, 0) + '°<br/>' +
+                                       'gimbal: ' + fmtNum(merged.pitch, 0) + '°<br/>' +
+                                       'gps: ' + (merged.hasGPSFix ? 'LOCKED' : 'NO FIX') + '<br/>' +
+                                       'camels tracked: ' + camelCount +
+                                   '</div>';
+                               }
 
                 function upsertDrone(id, d) {
                     const lat = d.drone?.lat;
@@ -2197,28 +2453,29 @@ app.get('/map-wall', (req, res) => {
                                        return;
                                    }
                                    list.innerHTML = ids.map((id) => {
-                                       const d = dronesById[id];
-                                       const online = isOnline(d);
-                                       const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
-                                       const hasFix = !!d.drone?.hasGPSFix;
-                                       return '<div class="mw-drone-row">' +
-                                           '<div class="mw-row-head">' +
-                                               '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
-                                               '<span class="name">' + (d.name || id) + '</span>' +
-                                               '<span class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</span>' +
-                                           '</div>' +
-                                           '<div class="mw-row-stats">' +
-                                               '<span>lat <b>' + fmtNum(d.drone?.lat, 6) + '</b></span>' +
-                                               '<span>lng <b>' + fmtNum(d.drone?.lng, 6) + '</b></span>' +
-                                               '<span>alt <b>' + fmtNum(d.drone?.alt, 1) + 'm</b></span>' +
-                                               '<span>yaw <b>' + fmtNum(d.drone?.yaw, 0) + '°</b></span>' +
-                                               '<span>gimbal <b>' + fmtNum(d.drone?.pitch, 0) + '°</b></span>' +
-                                               '<span>roll <b>' + fmtNum(d.drone?.roll, 0) + '°</b></span>' +
-                                               '<span>gps <b class="' + (hasFix ? 'accent' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
-                                               '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
-                                           '</div>' +
-                                       '</div>';
-                                   }).join('');
+                                                                          const d = dronesById[id];
+                                                                          const online = isOnline(d);
+                                                                          const merged = mergeWithLastKnown(id, d.drone);
+                                                                          const camelCount = mergeCamelCount(id, d.camels, d.camelCount);
+                                                                          const hasFix = !!merged.hasGPSFix;
+                                                                          return '<div class="mw-drone-row">' +
+                                                                              '<div class="mw-row-head">' +
+                                                                                  '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
+                                                                                  '<span class="name">' + (d.name || id) + '</span>' +
+                                                                                  '<span class="status">' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '</span>' +
+                                                                              '</div>' +
+                                                                              '<div class="mw-row-stats">' +
+                                                                                  '<span>lat <b>' + fmtNum(merged.lat, 6) + '</b></span>' +
+                                                                                  '<span>lng <b>' + fmtNum(merged.lng, 6) + '</b></span>' +
+                                                                                  '<span>alt <b>' + fmtNum(merged.alt, 1) + 'm</b></span>' +
+                                                                                  '<span>yaw <b>' + fmtNum(merged.yaw, 0) + '°</b></span>' +
+                                                                                  '<span>gimbal <b>' + fmtNum(merged.pitch, 0) + '°</b></span>' +
+                                                                                  '<span>roll <b>' + fmtNum(merged.roll, 0) + '°</b></span>' +
+                                                                                  '<span>gps <b class="' + (hasFix ? 'accent' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
+                                                                                  '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
+                                                                              '</div>' +
+                                                                          '</div>';
+                                                                      }).join('');
                                }
 
     function applyUpdate(data) {
@@ -2258,10 +2515,411 @@ app.get('/map-wall', (req, res) => {
 });
 
 // ==========================================
+// 5d. HISTORY WALL — same satellite map as the Map Wall, but instead of
+// live telemetry it replays logged flights from
+// drone_log/<droneId>/<date>.jsonl via /api/history/query. A timeline
+// slider (with hour ticks across the selected day range) scrubs through the
+// loaded window; Play advances it automatically at a selectable speed.
+// ==========================================
+app.get('/history-wall', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>FFly History Wall</title>
+            <script>(function(){try{document.documentElement.setAttribute('data-theme', localStorage.getItem('ffly_theme') || 'light');}catch(e){}})();</script>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+            <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+            <style>${sharedStyles()}
+                .hw-layout {
+                    flex: 1 1 auto; min-height: 0;
+                    display: grid;
+                    grid-template-columns: 1fr 320px;
+                    grid-template-rows: 1fr auto;
+                    gap: 20px;
+                    padding: 20px 28px 28px;
+                }
+                @media (max-width: 980px) {
+                    .hw-layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto auto; }
+                }
+                .hw-timeline-panel { grid-column: 1 / -1; flex: 0 0 auto; }
+                .hw-timeline-body { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+                .hw-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+                .hw-row label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; }
+                .hw-row input[type="datetime-local"] {
+                    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+                    padding: 6px 8px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px;
+                }
+                .hw-btn {
+                    padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
+                    background: var(--panel-raised); color: var(--text); font-size: 12px; font-weight: 600;
+                }
+                .hw-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+                .hw-btn.play { border-color: var(--cyan); color: var(--cyan); min-width: 74px; }
+                .hw-btn.play.playing { background: var(--cyan); color: #06201f; }
+                select.hw-speed {
+                    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+                    padding: 6px 10px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px;
+                }
+                .hw-slider-wrap { position: relative; padding-bottom: 18px; }
+                input[type="range"].hw-slider { width: 100%; accent-color: var(--cyan); }
+                .hw-ticks { position: relative; height: 14px; margin-top: 2px; }
+                .hw-tick { position: absolute; top: 0; font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--text-faint); transform: translateX(-50%); white-space: nowrap; }
+                .hw-current-time { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--cyan); min-width: 190px; }
+                .hw-status { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-faint); }
+            </style>
+        </head>
+        <body>
+            ${topBar(0, 'history-wall')}
+            <div class="hw-layout">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h3>Flight History — Satellite Map</h3>
+                        <span class="mono" style="font-size:11px;color:var(--text-faint);" id="hwCount">0 drones &middot; 0 camels tracked</span>
+                    </div>
+                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                        <div id="hwMap"></div>
+                        <div class="map-legend">
+                            <div class="row"><span class="swatch fov"></span>camera FOV</div>
+                            <div class="row"><span class="swatch camel"></span>camel tracked</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header"><h3>Telemetry at Playhead</h3></div>
+                    <div class="mw-telemetry-list scrollbar" id="hwTelemetryList">
+                        <div class="mw-telemetry-empty">Load a date range to see logged flights.</div>
+                    </div>
+                </div>
+
+                <div class="panel hw-timeline-panel">
+                    <div class="panel-header"><h3>Timeline</h3><span class="hw-status" id="hwStatus">no data loaded</span></div>
+                    <div class="hw-timeline-body">
+                        <div class="hw-row">
+                            <label>Start</label>
+                            <input type="datetime-local" id="hwStart" />
+                            <label>End</label>
+                            <input type="datetime-local" id="hwEnd" />
+                            <button class="hw-btn" id="hwLoadBtn">Load</button>
+                            <button class="hw-btn play" id="hwPlayBtn">▶ Play</button>
+                            <label>Speed</label>
+                            <select class="hw-speed" id="hwSpeed">
+                                <option value="0.5">0.5x</option>
+                                <option value="1" selected>1x</option>
+                                <option value="2">2x</option>
+                                <option value="4">4x</option>
+                                <option value="8">8x</option>
+                                <option value="16">16x</option>
+                            </select>
+                            <span class="hw-current-time" id="hwCurrentTime">—</span>
+                        </div>
+                        <div class="hw-slider-wrap">
+                            <input type="range" class="hw-slider" id="hwSlider" min="0" max="1000" value="0" disabled />
+                            <div class="hw-ticks" id="hwTicks"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <script>
+                ${clientCoreScript()}
+                initThemeToggle('themeToggle');
+
+                const map = L.map('hwMap', { zoomControl: true }).setView([22.3098, 39.1065], 17);
+                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
+                const markers = {}, fovLayers = {}, camelLayers = {};
+                let didInitialFit = false;
+
+                function fmtNum(n, digits) { return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits); }
+
+                function droneIcon(armed) {
+                    return L.divIcon({
+                        className: '',
+                        html: '<div style="width:16px;height:16px;border-radius:50%;background:' + (armed ? '#e8a33d' : '#57c77a') + ';border:2px solid #0d1117;box-shadow:0 0 0 2px rgba(255,255,255,0.15);"></div>',
+                        iconSize: [16, 16], iconAnchor: [8, 8]
+                    });
+                }
+
+                function popupHTML(id, d) {
+                    const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
+                    return '<div class="mw-popup"><b>' + (d.name || id) + '</b><br/>' +
+                                            'as of: ' + formatUtc3(d.ts) + '<br/>' +
+                        'alt: ' + fmtNum(d.drone?.alt, 1) + ' m<br/>' +
+                        'yaw: ' + fmtNum(d.drone?.yaw, 0) + '°<br/>' +
+                        'gimbal: ' + fmtNum(d.drone?.pitch, 0) + '°<br/>' +
+                        'gps: ' + (d.drone?.hasGPSFix ? 'LOCKED' : 'NO FIX') + '<br/>' +
+                        'camels tracked: ' + camelCount + '</div>';
+                }
+
+                function upsertDroneOnMap(id, d) {
+                    const lat = d.drone?.lat, lng = d.drone?.lng;
+                    if (typeof lat !== 'number' || typeof lng !== 'number') return;
+
+                    if (markers[id]) {
+                        markers[id].setLatLng([lat, lng]);
+                        markers[id].setIcon(droneIcon(d.armed));
+                        markers[id].setPopupContent(popupHTML(id, d));
+                    } else {
+                        markers[id] = L.marker([lat, lng], { icon: droneIcon(d.armed) }).addTo(map).bindPopup(popupHTML(id, d));
+                    }
+
+                    const poly = preciseFovPolygon(lat, lng, d.drone?.alt, d.drone?.yaw, d.drone?.pitch, d.drone?.roll);
+                    if (fovLayers[id]) {
+                        fovLayers[id].setLatLngs(poly);
+                    } else {
+                        fovLayers[id] = L.polygon(poly, { color: '#5fd4d0', weight: 1.5, fillColor: '#5fd4d0', fillOpacity: 0.22, interactive: false }).addTo(map);
+                    }
+
+                    const camels = Array.isArray(d.camels) ? d.camels : [];
+                    if (!camelLayers[id]) camelLayers[id] = L.layerGroup().addTo(map);
+                    camelLayers[id].clearLayers();
+                    camels.forEach((c) => {
+                        if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                            L.circleMarker([c.lat, c.lng], { radius: 5, color: '#e5484d', weight: 1, fillColor: '#e5484d', fillOpacity: 0.9, interactive: false }).addTo(camelLayers[id]);
+                        }
+                    });
+                }
+
+                function removeDroneFromMap(id) {
+                    if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
+                    if (fovLayers[id]) { map.removeLayer(fovLayers[id]); delete fovLayers[id]; }
+                    if (camelLayers[id]) { map.removeLayer(camelLayers[id]); delete camelLayers[id]; }
+                }
+
+                let recordsByDrone = {};
+                let allDroneIds = [];
+                let rangeStartMs = null, rangeEndMs = null;
+                let playTimer = null;
+                let isPlaying = false;
+
+     // Display on this page is fixed to UTC+3 regardless of the
+                     // browser's own timezone — logs are stored as true UTC epoch ms,
+                     // shifted only here at render time.
+                     const DISPLAY_TZ_OFFSET_MS = 3 * 60 * 60 * 1000;
+                     function toDatetimeLocalValue(ms) {
+                         const shifted = new Date(ms + DISPLAY_TZ_OFFSET_MS);
+                         const pad = (n) => String(n).padStart(2, '0');
+                         return shifted.getUTCFullYear() + '-' + pad(shifted.getUTCMonth() + 1) + '-' + pad(shifted.getUTCDate()) + 'T' + pad(shifted.getUTCHours()) + ':' + pad(shifted.getUTCMinutes());
+                     }
+                     // Parses a <input type="datetime-local"> value (a UTC+3 wall-clock
+                     // time, matching toDatetimeLocalValue above) back into a true UTC
+                     // epoch ms for querying /api/history/query.
+                     function fromDatetimeLocalValueToUtcMs(value) {
+                         const utcAsIfLocal = Date.parse(value + ':00Z');
+                         return utcAsIfLocal - DISPLAY_TZ_OFFSET_MS;
+                     }
+                     function formatUtc3(ms, mode) {
+                         const shifted = new Date(ms + DISPLAY_TZ_OFFSET_MS);
+                         const pad = (n) => String(n).padStart(2, '0');
+                         if (mode === 'time') return pad(shifted.getUTCHours()) + ':' + pad(shifted.getUTCMinutes()) + ':' + pad(shifted.getUTCSeconds());
+                         if (mode === 'short') return pad(shifted.getUTCMonth() + 1) + '/' + pad(shifted.getUTCDate()) + ' ' + pad(shifted.getUTCHours()) + ':' + pad(shifted.getUTCMinutes());
+                         return shifted.getUTCFullYear() + '-' + pad(shifted.getUTCMonth() + 1) + '-' + pad(shifted.getUTCDate()) + ' ' + pad(shifted.getUTCHours()) + ':' + pad(shifted.getUTCMinutes()) + ':' + pad(shifted.getUTCSeconds()) + ' UTC+3';
+                     }
+
+                fetch('/api/history/range').then(r => r.json()).then((info) => {
+                    if (info.earliest) document.getElementById('hwStart').value = toDatetimeLocalValue(Date.parse(info.earliest));
+                    if (info.latest) document.getElementById('hwEnd').value = toDatetimeLocalValue(Date.parse(info.latest));
+                }).catch(() => {});
+
+                function renderTicks() {
+                    const ticksEl = document.getElementById('hwTicks');
+                    ticksEl.innerHTML = '';
+                    if (rangeStartMs === null || rangeEndMs === null || rangeEndMs <= rangeStartMs) return;
+                    const totalMs = rangeEndMs - rangeStartMs;
+                    const totalHours = totalMs / 3600000;
+                    const steps = [1, 2, 3, 6, 12, 24, 48, 96];
+                    let stepHours = steps.find((s) => totalHours / s <= 10) || steps[steps.length - 1];
+                    for (let h = 0; h <= totalHours; h += stepHours) {
+                        const ms = rangeStartMs + h * 3600000;
+                        if (ms > rangeEndMs) break;
+                        const pct = ((ms - rangeStartMs) / totalMs) * 100;
+                        const label = document.createElement('div');
+                        label.className = 'hw-tick';
+                        label.style.left = pct + '%';
+                        label.innerText = formatUtc3(ms, 'short');
+                        ticksEl.appendChild(label);
+                    }
+                }
+
+                function recordAtOrBefore(records, targetMs) {
+                    if (!records || records.length === 0) return null;
+                    let lo = 0, hi = records.length - 1, result = null;
+                    while (lo <= hi) {
+                        const mid = (lo + hi) >> 1;
+                        if (records[mid].ts <= targetMs) { result = records[mid]; lo = mid + 1; }
+                        else hi = mid - 1;
+                    }
+                    return result;
+                }
+
+                function renderTelemetryListAt(targetMs) {
+                    const list = document.getElementById('hwTelemetryList');
+                    if (allDroneIds.length === 0) {
+                        list.innerHTML = '<div class="mw-telemetry-empty">Load a date range to see logged flights.</div>';
+                        return;
+                    }
+                    list.innerHTML = allDroneIds.map((id) => {
+                        const d = recordAtOrBefore(recordsByDrone[id], targetMs);
+                        if (!d) return '';
+                        const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
+                        const hasFix = !!d.drone?.hasGPSFix;
+                        return '<div class="mw-drone-row">' +
+                            '<div class="mw-row-head">' +
+                                '<span class="dot ' + (d.armed ? 'armed' : 'online') + '"></span>' +
+                                '<span class="name">' + (d.name || id) + '</span>' +
+                                '<span class="status">' + formatUtc3(d.ts, 'time') + ' UTC+3</span>' +
+                            '</div>' +
+                            '<div class="mw-row-stats">' +
+                                '<span>lat <b>' + fmtNum(d.drone?.lat, 6) + '</b></span>' +
+                                '<span>lng <b>' + fmtNum(d.drone?.lng, 6) + '</b></span>' +
+                                '<span>alt <b>' + fmtNum(d.drone?.alt, 1) + 'm</b></span>' +
+                                '<span>yaw <b>' + fmtNum(d.drone?.yaw, 0) + '°</b></span>' +
+                                '<span>gimbal <b>' + fmtNum(d.drone?.pitch, 0) + '°</b></span>' +
+                                '<span>gps <b class="' + (hasFix ? 'accent' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
+                                '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
+                            '</div></div>';
+                    }).join('');
+                }
+
+                function updateSummaryAt(targetMs) {
+                    let droneCount = 0, camelTotal = 0;
+                    allDroneIds.forEach((id) => {
+                        const d = recordAtOrBefore(recordsByDrone[id], targetMs);
+                        if (d) { droneCount++; camelTotal += Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0); }
+                    });
+                    document.getElementById('hwCount').innerText = droneCount + ' drones \u00b7 ' + camelTotal + ' camels tracked';
+                    const countEl = document.getElementById('fleetCount');
+                    if (countEl) countEl.innerText = droneCount;
+                }
+
+                function renderAt(targetMs) {
+                    allDroneIds.forEach((id) => {
+                        const d = recordAtOrBefore(recordsByDrone[id], targetMs);
+                        if (d) upsertDroneOnMap(id, d);
+                        else removeDroneFromMap(id);
+                    });
+                    renderTelemetryListAt(targetMs);
+                    updateSummaryAt(targetMs);
+                    document.getElementById('hwCurrentTime').innerText = formatUtc3(targetMs);
+                }
+
+                function currentSliderMs() {
+                    const slider = document.getElementById('hwSlider');
+                    const pct = Number(slider.value) / Number(slider.max);
+                    return rangeStartMs + pct * (rangeEndMs - rangeStartMs);
+                }
+
+                document.getElementById('hwSlider').addEventListener('input', () => {
+                    if (rangeStartMs === null) return;
+                    renderAt(currentSliderMs());
+                });
+
+                document.getElementById('hwLoadBtn').addEventListener('click', () => {
+                    const startVal = document.getElementById('hwStart').value;
+                    const endVal = document.getElementById('hwEnd').value;
+                    if (!startVal || !endVal) { document.getElementById('hwStatus').innerText = 'pick a start and end date first'; return; }
+                    const startMs = fromDatetimeLocalValueToUtcMs(startVal);
+                                        const endMs = fromDatetimeLocalValueToUtcMs(endVal);
+                    if (isNaN(startMs) || isNaN(endMs) || endMs <= startMs) { document.getElementById('hwStatus').innerText = 'end must be after start'; return; }
+
+                    document.getElementById('hwStatus').innerText = 'loading…';
+                    stopPlayback();
+
+                    fetch('/api/history/query?start=' + encodeURIComponent(new Date(startMs).toISOString()) + '&end=' + encodeURIComponent(new Date(endMs).toISOString()))
+                        .then(r => r.json())
+                        .then((data) => {
+                            recordsByDrone = {};
+                            (data.records || []).forEach((rec) => {
+                                const id = rec.droneId || 'drone-1';
+                                if (!recordsByDrone[id]) recordsByDrone[id] = [];
+                                recordsByDrone[id].push(rec);
+                            });
+                            allDroneIds = Object.keys(recordsByDrone);
+                            allDroneIds.forEach((id) => recordsByDrone[id].sort((a, b) => a.ts - b.ts));
+
+                            Object.keys(markers).forEach(removeDroneFromMap);
+
+                            if (data.records && data.records.length > 0) {
+                                rangeStartMs = startMs;
+                                rangeEndMs = endMs;
+                                document.getElementById('hwSlider').disabled = false;
+                                document.getElementById('hwSlider').value = 0;
+                                document.getElementById('hwStatus').innerText = data.records.length + ' packets \u00b7 ' + allDroneIds.length + ' drone(s) loaded';
+                                renderTicks();
+                                renderAt(rangeStartMs);
+
+                                if (!didInitialFit) {
+                                    const first = data.records.find((r) => typeof r.drone?.lat === 'number');
+                                    if (first) { map.setView([first.drone.lat, first.drone.lng], 17); didInitialFit = true; }
+                                }
+                            } else {
+                                rangeStartMs = startMs;
+                                rangeEndMs = endMs;
+                                document.getElementById('hwSlider').disabled = true;
+                                document.getElementById('hwStatus').innerText = 'no logged telemetry in that range';
+                                renderTicks();
+                            }
+                        })
+                        .catch((err) => {
+                            document.getElementById('hwStatus').innerText = 'failed to load history: ' + err.message;
+                        });
+                });
+
+                function stopPlayback() {
+                    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+                    isPlaying = false;
+                    const btn = document.getElementById('hwPlayBtn');
+                    btn.innerText = '▶ Play';
+                    btn.classList.remove('playing');
+                }
+
+                function startPlayback() {
+                    if (rangeStartMs === null || rangeEndMs === null) return;
+                    isPlaying = true;
+                    const btn = document.getElementById('hwPlayBtn');
+                    btn.innerText = '❚❚ Pause';
+                    btn.classList.add('playing');
+
+                    const slider = document.getElementById('hwSlider');
+                    const tickMs = 250;
+                    playTimer = setInterval(() => {
+                        const speed = Number(document.getElementById('hwSpeed').value) || 1;
+                        const rangeMs = rangeEndMs - rangeStartMs;
+                        const advanceMs = tickMs * speed * 60;
+                        const currentPct = Number(slider.value) / Number(slider.max);
+                        const currentMs = rangeStartMs + currentPct * rangeMs;
+                        const nextMs = currentMs + advanceMs;
+
+                        if (nextMs >= rangeEndMs) {
+                            slider.value = slider.max;
+                            renderAt(rangeEndMs);
+                            stopPlayback();
+                            return;
+                        }
+                        slider.value = Math.round(((nextMs - rangeStartMs) / rangeMs) * Number(slider.max));
+                        renderAt(nextMs);
+                    }, tickMs);
+                }
+
+                document.getElementById('hwPlayBtn').addEventListener('click', () => {
+                    if (isPlaying) stopPlayback();
+                    else startPlayback();
+                });
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// ==========================================
 // 6. SERVER INITIALIZATION
 // ==========================================
 const PORT = process.env.PORT || 3000;
 fs.mkdirSync(TILE_CACHE_DIR, { recursive: true });
+fs.mkdirSync(DRONE_LOG_DIR, { recursive: true });
 server.listen(PORT, () => {
     console.log(`============================================`);
     console.log(`FFly Ground Control Server active on port ${PORT}`);
@@ -2270,7 +2928,9 @@ server.listen(PORT, () => {
     console.log(`- Dashboard (map + control + live + telemetry): http://localhost:3000/dashboard`);
     console.log(`- Video Wall (per-drone card: video + map + telemetry): http://localhost:3000/video-wall`);
     console.log(`- Map Wall (satellite map: all drones + FOV + camels): http://localhost:3000/map-wall`);
-    console.log(`- Satellite tile cache: ${TILE_CACHE_DIR}`);
+        console.log(`- History Wall (timeline playback of past flights): http://localhost:3000/history-wall`);
+        console.log(`- Satellite tile cache: ${TILE_CACHE_DIR}`);
+        console.log(`- Per-drone flight logs: ${DRONE_LOG_DIR}`);
     console.log(`  Drop your own tiles as <z>/<x>/<y>.png to fly fully offline over that area.`);
     console.log(`  Requires Node 18+ for the built-in fetch() used to cache new tiles.`);
     console.log(`============================================`);
