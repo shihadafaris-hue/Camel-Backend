@@ -732,6 +732,27 @@ function sharedStyles() {
         .map-legend .swatch.camel { background: var(--red); box-shadow: 0 0 0 2px rgba(229,72,77,0.3); }
         .map-legend .swatch.fov { background: rgba(95,212,208,0.35); border: 1px solid var(--cyan); border-radius: 2px; }
 
+                /* Compact single-row drone strip (Map Wall / History Wall) — fixed,
+                   small height so the map underneath keeps almost all the vertical
+                   space; scrolls horizontally instead of wrapping to a second row. */
+                .mw-drone-strip {
+                    flex: 0 0 auto;
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    padding: 6px 14px;
+                    border-bottom: 1px solid var(--border);
+                    overflow-x: auto;
+                    white-space: nowrap;
+                }
+                .mw-drone-strip::-webkit-scrollbar { height: 5px; }
+                .mw-drone-strip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+                .mw-drone-strip .nav-link {
+                    flex: 0 0 auto;
+                    padding: 4px 10px;
+                    font-size: 10px;
+                }
+
         .video-container {
             position: relative; width: 100%; flex: 1 1 auto; min-height: 0; background: #05070a;
             overflow: hidden;
@@ -894,17 +915,22 @@ function sharedStyles() {
         .fw-card .fw-telemetry .accent { color: var(--cyan); }
 
        /* ---- map wall ---- */
-               .mw-layout {
-                   flex: 1 1 auto;
-                   min-height: 0;
-                   display: grid;
-                   grid-template-columns: 1fr 320px;
-                   gap: 20px;
-                   padding: 20px 28px 28px;
-               }
-               @media (max-width: 980px) {
-                   .mw-layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
-               }
+                      .mw-layout {
+                          flex: 1 1 auto;
+                          min-height: 0;
+                          display: grid;
+                          grid-template-columns: 1fr 320px;
+                          grid-template-rows: minmax(0, 1fr);
+                          gap: 20px;
+                          padding: 20px 28px 28px;
+                      }
+                      .mw-layout > .panel {
+                          min-height: 0;
+                          height: 100%;
+                      }
+                      @media (max-width: 980px) {
+                          .mw-layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+                      }
                .mw-popup { font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; }
                .mw-popup b { color: #0d1117; }
 
@@ -1503,7 +1529,10 @@ app.get('/dashboard', (req, res) => {
 
                 // ---------- Map ----------
                 const map = L.map('map', { zoomControl: true }).setView([22.3098, 39.1065], 17);
-                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
+                                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
+                                requestAnimationFrame(() => { try { map.invalidateSize(); } catch (e) {} });
+                                setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 250);
+                                window.addEventListener('resize', () => { try { map.invalidateSize(); } catch (e) {} });
                 const markers = {};
                 const fovLayers = {};      // droneId -> L.polygon (precise camera FOV footprint)
                 const camelLayers = {};    // droneId -> L.layerGroup of red dots
@@ -1665,31 +1694,36 @@ app.get('/dashboard', (req, res) => {
                     });
                 }
 
-                function applyUpdate(data) {
-                    const id = data.droneId || 'drone-1';
-                    dronesById[id] = data;
-                    if (!selectedDroneId) selectDrone(id);
-                    upsertMarker(id, data);
-                    renderFleetList();
+    let didInitialFit = false;
 
-                    // Only re-render the telemetry panel if this update is for the
-                    // currently selected drone (or nothing is selected yet).
-                    if (!selectedDroneId || id === selectedDroneId) updateTelemetryPanel();
+        function applyUpdate(data) {
+            const id = data.droneId || 'drone-1';
+            const isFirstFixForFleet = !didInitialFit && typeof data.drone?.lat === 'number';
+            dronesById[id] = data;
 
-                    const countEl = document.getElementById('fleetCount');
-                    if (countEl) countEl.innerText = Object.keys(dronesById).length;
+            try {
+                upsertMarker(id, data);
+            } catch (e) {
+                console.error('[dashboard] error updating marker', id, e);
+            }
 
-                    // If we had a remembered selection (e.g. from before a
-                    // refresh) but hadn't loaded its stream yet, do it now that
-                    // its telemetry has arrived.
-                    if (id === selectedDroneId && !livePlayer && data.streamKey) {
-                        document.getElementById('selectedLabel').innerText = id;
-                        document.getElementById('targetDroneLabel').innerText = 'target: ' + id;
-                        setControlsEnabled(true);
-                        document.getElementById('streamKeyInput').value = data.streamKey;
-                        startLiveVideo(data.streamKey);
-                    }
-                }
+            renderFleetList();
+            if (id === selectedDroneId) updateTelemetryPanel();
+
+            // Center the map on the very first GPS fix we ever see, so
+            // the page doesn't sit on the default fallback coordinates
+            // once real telemetry starts arriving.
+            if (isFirstFixForFleet) {
+                didInitialFit = true;
+                map.setView([data.drone.lat, data.drone.lng], 17);
+            }
+
+            // If this drone is the one currently selected, keep the map
+            // centered on it as new telemetry arrives (follow mode).
+            if (selectedDroneId === id && typeof data.drone?.lat === 'number') {
+                map.panTo([data.drone.lat, data.drone.lng], { animate: true });
+            }
+        }
 
                 const socket = setupResilientFeed(applyUpdate, 'connPill', 'connLabel');
                socket.on('leader_update', (payload) => {
@@ -2306,19 +2340,20 @@ app.get('/map-wall', (req, res) => {
         </head>
         <body>
             ${topBar(0, 'map-wall')}
-      <div class="mw-layout">
+      <<div class="mw-layout">
                       <div class="panel">
                           <div class="panel-header">
                               <h3>Fleet Satellite Map</h3>
                               <span class="mono" style="font-size:11px;color:var(--text-faint);" id="mwCount">0 drones &middot; 0 camels tracked</span>
                           </div>
-                          <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
-                              <div id="mwMap"></div>
-                              <div class="map-legend">
-                                  <div class="row"><span class="swatch fov"></span>camera FOV</div>
-                                  <div class="row"><span class="swatch camel"></span>camel tracked</div>
-                              </div>
-                          </div>
+                          <div class="mw-drone-strip" id="mwDroneSelect"></div>
+                                                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                                                        <div id="mwMap"></div>
+                                                        <div class="map-legend">
+                                                            <div class="row"><span class="swatch fov"></span>camera FOV</div>
+                                                            <div class="row"><span class="swatch camel"></span>camel tracked</div>
+                                                        </div>
+                                                    </div>
                       </div>
 
                       <div class="panel">
@@ -2332,21 +2367,30 @@ app.get('/map-wall', (req, res) => {
             <script>
                 ${clientCoreScript()}
 
-                const dronesById = {};
-                const markers = {};
-                const fovLayers = {};
-                const camelLayers = {};
-                let didInitialFit = false;
+              const dronesById = {};
+                              const markers = {};
+                              const fovLayers = {};
+                              const camelLayers = {};
+                              let didInitialFit = false;
+                              let selectedDroneId = null; // null = "All" (fit whole fleet)
 
                 const map = L.map('mwMap', { zoomControl: true }).setView([22.3098, 39.1065], 17);
 
-                // Google satellite tiles — same source used in map_html_gen.py's
-                // generated per-flight dashboard, so the aerial imagery style
-                // matches what's already familiar from those single-flight reviews.
-                L.tileLayer('/tiles/{z}/{x}/{y}.png', {
-                    maxZoom: 22,
-                    attribution: 'Satellite imagery via local tile cache'
-                }).addTo(map);
+                                // Google satellite tiles — same source used in map_html_gen.py's
+                                // generated per-flight dashboard, so the aerial imagery style
+                                // matches what's already familiar from those single-flight reviews.
+                                L.tileLayer('/tiles/{z}/{x}/{y}.png', {
+                                    maxZoom: 22,
+                                    attribution: 'Satellite imagery via local tile cache'
+                                }).addTo(map);
+
+                                // Leaflet can compute its size before the flex layout has
+                                // finished settling, leaving a blank gap above the tiles
+                                // until the window is manually resized. Force a resize check
+                                // once after layout settles, and again on any real resize.
+                                requestAnimationFrame(() => { try { map.invalidateSize(); } catch (e) {} });
+                                setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 250);
+                                window.addEventListener('resize', () => { try { map.invalidateSize(); } catch (e) {} });
 
                function fmtNum(n, digits) {
                                    return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits);
@@ -2377,9 +2421,42 @@ app.get('/map-wall', (req, res) => {
                                        'yaw: ' + fmtNum(merged.yaw, 0) + '°<br/>' +
                                        'gimbal: ' + fmtNum(merged.pitch, 0) + '°<br/>' +
                                        'gps: ' + (merged.hasGPSFix ? 'LOCKED' : 'NO FIX') + '<br/>' +
-                                       'camels tracked: ' + camelCount +
-                                   '</div>';
-                               }
+                   'camels tracked: ' + camelCount +
+                                                      '</div>';
+                                                  }
+
+                                                  // ---------- drone select toolbar: "All" fits the whole fleet in
+                                                  // view, clicking a drone zooms in and keeps following it as new
+                                                  // telemetry arrives, until "All" (or another drone) is clicked. ----------
+                                                  function renderDroneSelect() {
+                                                      const container = document.getElementById('mwDroneSelect');
+                                                      if (!container) return;
+                                                      const ids = Object.keys(dronesById);
+                                                      const pills = ['<button type="button" class="nav-link ' + (selectedDroneId === null ? 'active' : '') + '" data-select-id="__all__">All</button>']
+                                                          .concat(ids.map((id) => {
+                                                              const d = dronesById[id];
+                                                              const active = selectedDroneId === id ? 'active' : '';
+                                                              return '<button type="button" class="nav-link ' + active + '" data-select-id="' + id + '">' + (d.name || id) + '</button>';
+                                                          }));
+                                                      container.innerHTML = pills.join('');
+                                                      container.querySelectorAll('button[data-select-id]').forEach((btn) => {
+                                                          btn.addEventListener('click', () => {
+                                                              const val = btn.getAttribute('data-select-id');
+                                                              selectDroneOnMap(val === '__all__' ? null : val);
+                                                          });
+                                                      });
+                                                  }
+
+                                                  function selectDroneOnMap(id) {
+                                                      selectedDroneId = id;
+                                                      renderDroneSelect();
+                                                      if (id === null) {
+                                                          const latlngs = Object.values(markers).map((m) => m.getLatLng());
+                                                          if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40], maxZoom: 19 });
+                                                      } else if (markers[id]) {
+                                                          map.setView(markers[id].getLatLng(), Math.max(map.getZoom(), 18), { animate: true });
+                                                      }
+                                                  }
 
                 function upsertDrone(id, d) {
                     const lat = d.drone?.lat;
@@ -2458,7 +2535,8 @@ app.get('/map-wall', (req, res) => {
                                                                           const merged = mergeWithLastKnown(id, d.drone);
                                                                           const camelCount = mergeCamelCount(id, d.camels, d.camelCount);
                                                                           const hasFix = !!merged.hasGPSFix;
-                                                                          return '<div class="mw-drone-row">' +
+                                                                                                                                                    const sel = id === selectedDroneId ? ' style="box-shadow: inset 3px 0 0 var(--cyan);"' : '';
+                                                                                                                                                    return '<div class="mw-drone-row" data-id="' + id + '"' + sel + '>' +
                                                                               '<div class="mw-row-head">' +
                                                                                   '<span class="dot ' + (online ? (d.armed ? 'armed' : 'online') : 'offline') + '"></span>' +
                                                                                   '<span class="name">' + (d.name || id) + '</span>' +
@@ -2476,6 +2554,10 @@ app.get('/map-wall', (req, res) => {
                                                                               '</div>' +
                                                                           '</div>';
                                                                       }).join('');
+                                   list.querySelectorAll('.mw-drone-row').forEach((row) => {
+                                       row.style.cursor = 'pointer';
+                                       row.addEventListener('click', () => selectDroneOnMap(row.getAttribute('data-id')));
+                                   });
                                }
 
     function applyUpdate(data) {
@@ -2575,11 +2657,12 @@ app.get('/history-wall', (req, res) => {
             ${topBar(0, 'history-wall')}
             <div class="hw-layout">
                 <div class="panel">
-                    <div class="panel-header">
-                        <h3>Flight History — Satellite Map</h3>
-                        <span class="mono" style="font-size:11px;color:var(--text-faint);" id="hwCount">0 drones &middot; 0 camels tracked</span>
-                    </div>
-                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
+                                    <div class="panel-header">
+                                        <h3>Flight History — Satellite Map</h3>
+                                        <span class="mono" style="font-size:11px;color:var(--text-faint);" id="hwCount">0 drones &middot; 0 camels tracked</span>
+                                    </div>
+                                    <div class="mw-drone-strip" id="hwDroneSelect"></div>
+                                    <div style="position:relative; flex:1 1 auto; min-height:0; display:flex;">
                         <div id="hwMap"></div>
                         <div class="map-legend">
                             <div class="row"><span class="swatch fov"></span>camera FOV</div>
@@ -2629,9 +2712,13 @@ app.get('/history-wall', (req, res) => {
                 initThemeToggle('themeToggle');
 
                 const map = L.map('hwMap', { zoomControl: true }).setView([22.3098, 39.1065], 17);
-                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
+                                L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 22, attribution: 'Satellite imagery via local tile cache' }).addTo(map);
+                                requestAnimationFrame(() => { try { map.invalidateSize(); } catch (e) {} });
+                                setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 250);
+                                window.addEventListener('resize', () => { try { map.invalidateSize(); } catch (e) {} });
                 const markers = {}, fovLayers = {}, camelLayers = {};
-                let didInitialFit = false;
+                                let didInitialFit = false;
+                                let selectedDroneId = null; // null = "All" (fit whole fleet as it replays)
 
                 function fmtNum(n, digits) { return (typeof n === 'number' && !isNaN(n)) ? n.toFixed(digits) : (0).toFixed(digits); }
 
@@ -2684,10 +2771,43 @@ app.get('/history-wall', (req, res) => {
                 }
 
                 function removeDroneFromMap(id) {
-                    if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
-                    if (fovLayers[id]) { map.removeLayer(fovLayers[id]); delete fovLayers[id]; }
-                    if (camelLayers[id]) { map.removeLayer(camelLayers[id]); delete camelLayers[id]; }
-                }
+                                    if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
+                                    if (fovLayers[id]) { map.removeLayer(fovLayers[id]); delete fovLayers[id]; }
+                                    if (camelLayers[id]) { map.removeLayer(camelLayers[id]); delete camelLayers[id]; }
+                                }
+
+                                // ---------- drone select toolbar: same "All" vs. single-drone
+                                // follow behavior as the Map Wall, but driven by the playhead
+                                // instead of live telemetry. ----------
+                                function renderDroneSelect() {
+                                    const container = document.getElementById('hwDroneSelect');
+                                    if (!container) return;
+                                    const pills = ['<button type="button" class="nav-link ' + (selectedDroneId === null ? 'active' : '') + '" data-select-id="__all__">All</button>']
+                                        .concat(allDroneIds.map((id) => {
+                                            const recs = recordsByDrone[id];
+                                            const name = (recs && recs.length && recs[recs.length - 1].name) || id;
+                                            const active = selectedDroneId === id ? 'active' : '';
+                                            return '<button type="button" class="nav-link ' + active + '" data-select-id="' + id + '">' + name + '</button>';
+                                        }));
+                                    container.innerHTML = pills.join('');
+                                    container.querySelectorAll('button[data-select-id]').forEach((btn) => {
+                                        btn.addEventListener('click', () => {
+                                            const val = btn.getAttribute('data-select-id');
+                                            selectDroneOnMap(val === '__all__' ? null : val);
+                                        });
+                                    });
+                                }
+
+                                function selectDroneOnMap(id) {
+                                    selectedDroneId = id;
+                                    renderDroneSelect();
+                                    if (id === null) {
+                                        const latlngs = Object.values(markers).map((m) => m.getLatLng());
+                                        if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40], maxZoom: 19 });
+                                    } else if (markers[id]) {
+                                        map.setView(markers[id].getLatLng(), Math.max(map.getZoom(), 18), { animate: true });
+                                    }
+                                }
 
                 let recordsByDrone = {};
                 let allDroneIds = [];
@@ -2766,7 +2886,8 @@ app.get('/history-wall', (req, res) => {
                         if (!d) return '';
                         const camelCount = Array.isArray(d.camels) ? d.camels.length : (d.camelCount || 0);
                         const hasFix = !!d.drone?.hasGPSFix;
-                        return '<div class="mw-drone-row">' +
+                                                const sel = id === selectedDroneId ? ' style="box-shadow: inset 3px 0 0 var(--cyan);"' : '';
+                                                return '<div class="mw-drone-row" data-id="' + id + '"' + sel + '>' +
                             '<div class="mw-row-head">' +
                                 '<span class="dot ' + (d.armed ? 'armed' : 'online') + '"></span>' +
                                 '<span class="name">' + (d.name || id) + '</span>' +
@@ -2781,8 +2902,12 @@ app.get('/history-wall', (req, res) => {
                                 '<span>gps <b class="' + (hasFix ? 'accent' : 'warn') + '">' + (hasFix ? 'LOCKED' : 'NO FIX') + '</b></span>' +
                                 '<span>🐫 <b class="accent">' + camelCount + '</b></span>' +
                             '</div></div>';
-                    }).join('');
-                }
+                                                }).join('');
+                                                list.querySelectorAll('.mw-drone-row').forEach((row) => {
+                                                    row.style.cursor = 'pointer';
+                                                    row.addEventListener('click', () => selectDroneOnMap(row.getAttribute('data-id')));
+                                                });
+                                            }
 
                 function updateSummaryAt(targetMs) {
                     let droneCount = 0, camelTotal = 0;
@@ -2796,15 +2921,25 @@ app.get('/history-wall', (req, res) => {
                 }
 
                 function renderAt(targetMs) {
-                    allDroneIds.forEach((id) => {
-                        const d = recordAtOrBefore(recordsByDrone[id], targetMs);
-                        if (d) upsertDroneOnMap(id, d);
-                        else removeDroneFromMap(id);
-                    });
-                    renderTelemetryListAt(targetMs);
-                    updateSummaryAt(targetMs);
-                    document.getElementById('hwCurrentTime').innerText = formatUtc3(targetMs);
-                }
+                                    allDroneIds.forEach((id) => {
+                                        const d = recordAtOrBefore(recordsByDrone[id], targetMs);
+                                        if (d) upsertDroneOnMap(id, d);
+                                        else removeDroneFromMap(id);
+                                    });
+                                    renderTelemetryListAt(targetMs);
+                                    updateSummaryAt(targetMs);
+                                    document.getElementById('hwCurrentTime').innerText = formatUtc3(targetMs);
+
+                                    // Follow mode: keep the map centered on the selected drone as
+                                    // the playhead moves, the same way the Map Wall follows live
+                                    // telemetry for a selected drone.
+                                    if (selectedDroneId !== null) {
+                                        const d = recordAtOrBefore(recordsByDrone[selectedDroneId], targetMs);
+                                        if (d && typeof d.drone?.lat === 'number') {
+                                            map.panTo([d.drone.lat, d.drone.lng], { animate: true });
+                                        }
+                                    }
+                                }
 
                 function currentSliderMs() {
                     const slider = document.getElementById('hwSlider');
@@ -2838,9 +2973,11 @@ app.get('/history-wall', (req, res) => {
                                 recordsByDrone[id].push(rec);
                             });
                             allDroneIds = Object.keys(recordsByDrone);
-                            allDroneIds.forEach((id) => recordsByDrone[id].sort((a, b) => a.ts - b.ts));
+                                                        allDroneIds.forEach((id) => recordsByDrone[id].sort((a, b) => a.ts - b.ts));
 
-                            Object.keys(markers).forEach(removeDroneFromMap);
+                                                        Object.keys(markers).forEach(removeDroneFromMap);
+                                                        if (selectedDroneId !== null && allDroneIds.indexOf(selectedDroneId) === -1) selectedDroneId = null;
+                                                        renderDroneSelect();
 
                             if (data.records && data.records.length > 0) {
                                 rangeStartMs = startMs;
